@@ -5,14 +5,28 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QCheckBox, QLabel
 
+from orbit_control.github_tools import GitHubRepo, summarize_repositories
 from orbit_control.models import ServiceConfig
 from orbit_control.process_manager import ProcessManager
-from orbit_control.ui import DragHandle, MainWindow, ServiceDialog
+from orbit_control.ui import DragHandle, GitHubDialog, MainWindow, ServiceDialog
+
+
+class FakeCloseEvent:
+    def __init__(self) -> None:
+        self.accepted = False
+        self.ignored = False
+
+    def accept(self) -> None:
+        self.accepted = True
+
+    def ignore(self) -> None:
+        self.ignored = True
 
 
 class DesktopTests(unittest.TestCase):
@@ -62,6 +76,373 @@ class DesktopTests(unittest.TestCase):
         window._closing = True
         window.thread_pool.waitForDone(1000)
         window.deleteLater()
+
+    def test_close_event_cancel_keeps_app_open(self) -> None:
+        window = MainWindow(self.manager)
+        window.refresh_timer.stop()
+        event = FakeCloseEvent()
+
+        with patch.object(window, "_close_confirmation", return_value="cancel"):
+            window.closeEvent(event)
+
+        self.assertTrue(event.ignored)
+        self.assertFalse(event.accepted)
+        self.assertFalse(window._closing)
+        window._closing = True
+        window.thread_pool.waitForDone(1000)
+        window.deleteLater()
+
+    def test_close_event_minimize_keeps_services_alive(self) -> None:
+        window = MainWindow(self.manager)
+        window.refresh_timer.stop()
+        event = FakeCloseEvent()
+
+        with (
+            patch.object(window, "_close_confirmation", return_value="minimize"),
+            patch.object(window, "_minimize_to_tray") as minimize,
+            patch.object(self.manager, "stop_all_services") as stop_all,
+        ):
+            window.closeEvent(event)
+
+        self.assertTrue(event.ignored)
+        self.assertFalse(event.accepted)
+        minimize.assert_called_once()
+        stop_all.assert_not_called()
+        self.assertFalse(window._closing)
+        window._closing = True
+        window.thread_pool.waitForDone(1000)
+        window.deleteLater()
+
+    def test_close_event_exit_stops_services_and_accepts(self) -> None:
+        window = MainWindow(self.manager)
+        window.refresh_timer.stop()
+        event = FakeCloseEvent()
+
+        with (
+            patch.object(window, "_close_confirmation", return_value="exit"),
+            patch.object(self.manager, "stop_all_services", return_value=(1, [])) as stop_all,
+        ):
+            window.closeEvent(event)
+
+        self.assertTrue(event.accepted)
+        self.assertFalse(event.ignored)
+        self.assertTrue(window._closing)
+        stop_all.assert_called_once()
+        window.thread_pool.waitForDone(1000)
+        window.deleteLater()
+
+    def test_projects_folder_button_opens_configured_projects_path(self) -> None:
+        window = MainWindow(self.manager)
+        window.refresh_timer.stop()
+
+        with (
+            patch("orbit_control.ui.PROJECTS_DIR", self.root),
+            patch("orbit_control.ui.QDesktopServices.openUrl") as open_url,
+        ):
+            window.open_projects_folder()
+
+        open_url.assert_called_once()
+        self.assertEqual(Path(open_url.call_args.args[0].toLocalFile()), self.root)
+        window._closing = True
+        window.thread_pool.waitForDone(1000)
+        window.deleteLater()
+
+    def test_backup_buttons_export_and_import_services_json(self) -> None:
+        service = ServiceConfig(name="Demo", target=str(self.script), working_directory=str(self.root))
+        self.manager.add_service(service)
+        window = MainWindow(self.manager)
+        window.refresh_timer.stop()
+        backup_path = self.root / "apps-backup"
+
+        with patch("orbit_control.ui.QFileDialog.getSaveFileName", return_value=(str(backup_path), "")):
+            window.export_services_backup()
+
+        backup_json = backup_path.with_suffix(".json")
+        self.assertTrue(backup_json.exists())
+        payload = json.loads(backup_json.read_text(encoding="utf-8"))
+        self.assertEqual(payload["format"], "orbit-control-services")
+        self.assertEqual(payload["services"][0]["name"], "Demo")
+
+        self.manager.remove_service(service.id)
+        with patch("orbit_control.ui.QFileDialog.getOpenFileName", return_value=(str(backup_json), "")):
+            window.import_services_backup()
+
+        self.assertEqual(self.manager.get_service(service.id).name, "Demo")
+        window._closing = True
+        window.thread_pool.waitForDone(1000)
+        window.deleteLater()
+
+    def test_github_panel_button_opens_dialog(self) -> None:
+        window = MainWindow(self.manager)
+        window.refresh_timer.stop()
+
+        with patch("orbit_control.ui.GitHubDialog") as dialog_class:
+            dialog = dialog_class.return_value
+            window.open_github_panel()
+
+        dialog_class.assert_called_once_with(window, self.manager)
+        dialog.exec.assert_called_once()
+        window._closing = True
+        window.thread_pool.waitForDone(1000)
+        window.deleteLater()
+
+    def test_github_dialog_saves_clears_and_deletes_token(self) -> None:
+        dialog = GitHubDialog(None, self.manager)
+        dialog.token_input.setText("ghp_demo")
+        dialog._github_login = "annibale"
+        dialog.save_token()
+
+        preferences = self.manager.storage.load_preferences()
+        self.assertEqual(preferences["github_token"], "ghp_demo")
+        self.assertEqual(preferences["github_active_connection"], "annibale")
+        self.assertEqual(preferences["github_connections"][0]["login"], "annibale")
+        self.assertEqual(preferences["github_connections"][0]["token"], "ghp_demo")
+        self.assertEqual(dialog.connection_combo.count(), 2)
+        dialog.token_input.clear()
+        self.assertEqual(dialog.token_input.text(), "")
+        dialog.connection_combo.setCurrentIndex(0)
+        dialog.connection_combo.setCurrentIndex(1)
+        self.assertEqual(dialog.token_input.text(), "ghp_demo")
+
+        dialog.delete_saved_token()
+
+        self.assertNotIn("github_token", self.manager.storage.load_preferences())
+        self.assertEqual(self.manager.storage.load_preferences().get("github_connections"), [])
+        self.assertEqual(dialog.account_label.text(), "Desconectado")
+        self.assertFalse(dialog.upload_button.isEnabled())
+        dialog.deleteLater()
+
+    def test_github_dialog_exports_and_imports_github_settings_json(self) -> None:
+        dialog = GitHubDialog(None, self.manager)
+        dialog.token_input.setText("ghp_demo")
+        dialog._github_login = "annibale"
+        dialog.save_token()
+        dialog.repo_combo.setEditText("annibale/demo")
+        dialog.private_check.setChecked(True)
+        settings_path = self.root / "github-settings"
+
+        with patch("orbit_control.ui.QFileDialog.getSaveFileName", return_value=(str(settings_path), "")):
+            dialog.export_github_settings()
+
+        settings_json = settings_path.with_suffix(".json")
+        payload = json.loads(settings_json.read_text(encoding="utf-8"))
+        self.assertEqual(payload["format"], "orbit-control-github-settings")
+        self.assertEqual(payload["github"]["connections"][0]["login"], "annibale")
+        dialog.deleteLater()
+
+        restored = GitHubDialog(None, self.manager)
+        restored.delete_saved_token()
+        with patch("orbit_control.ui.QFileDialog.getOpenFileName", return_value=(str(settings_json), "")):
+            restored.import_github_settings()
+
+        preferences = self.manager.storage.load_preferences()
+        self.assertEqual(preferences["github_connections"][0]["login"], "annibale")
+        self.assertEqual(restored.token_input.text(), "ghp_demo")
+        self.assertEqual(restored.repo_combo.currentText(), "annibale/demo")
+        self.assertTrue(restored.private_check.isChecked())
+        restored.deleteLater()
+
+    def test_github_dialog_lists_apps_and_suggests_repo_name(self) -> None:
+        service = ServiceConfig(name="Demo", target=str(self.script), working_directory=str(self.root))
+        self.manager.add_service(service)
+
+        dialog = GitHubDialog(None, self.manager)
+
+        self.assertEqual(dialog.app_combo.count(), 1)
+        self.assertEqual(dialog.app_combo.currentData(), service.id)
+        self.assertTrue(dialog.repo_combo.currentText())
+        dialog.deleteLater()
+
+    def test_github_dialog_accepts_unlisted_local_project_path(self) -> None:
+        project = self.root / "Projeto Livre"
+        project.mkdir()
+        dialog = GitHubDialog(None, self.manager)
+
+        dialog.app_combo.setEditText(str(project))
+        selected = dialog._selected_service()
+        dialog.repo_combo.clear()
+        dialog._sync_repo_name(force=True)
+
+        self.assertEqual(selected.name, "Projeto Livre")
+        self.assertEqual(Path(selected.working_directory), project)
+        self.assertEqual(Path(selected.target), project)
+        self.assertEqual(dialog.repo_combo.currentText(), "projeto-livre")
+        dialog.deleteLater()
+
+    def test_github_dialog_browse_button_sets_unlisted_project(self) -> None:
+        project = self.root / "Projeto Fora Do Orbit"
+        project.mkdir()
+        dialog = GitHubDialog(None, self.manager)
+
+        with patch("orbit_control.ui.QFileDialog.getExistingDirectory", return_value=str(project)):
+            dialog.browse_local_project()
+
+        self.assertEqual(dialog.app_combo.currentText(), str(project))
+        self.assertIn("Projeto livre", dialog.app_hint_label.text())
+        self.assertEqual(dialog.repo_combo.currentText(), "projeto-fora-do-orbit")
+        dialog.deleteLater()
+
+    def test_github_dialog_loads_repositories_into_dropdown(self) -> None:
+        dialog = GitHubDialog(None, self.manager)
+        repos = [
+            GitHubRepo("meu/user-api", "https://github.com/meu/user-api", "", False, 1, 2, 3, "main"),
+            GitHubRepo("meu/web-app", "https://github.com/meu/web-app", "", True, 4, 5, 6, "main"),
+        ]
+
+        dialog._apply_stats(repos, summarize_repositories(repos))
+
+        self.assertEqual(dialog.repo_combo.count(), 2)
+        self.assertEqual([dialog.repo_combo.itemText(index) for index in range(2)], ["meu/user-api", "meu/web-app"])
+        self.assertEqual(dialog.repo_list.count(), 2)
+        dialog._connected = True
+        dialog.repo_list.setCurrentRow(1)
+        self.assertEqual(dialog.repo_combo.currentText(), "meu/web-app")
+        self.assertEqual(dialog.selected_repo_label.toolTip(), "meu/web-app")
+        self.assertTrue(dialog.update_repo_button.isEnabled())
+        self.assertIn("2 repo", dialog.repo_count_label.text())
+        dialog.deleteLater()
+
+    def test_github_dialog_creates_new_repo_and_selects_it(self) -> None:
+        dialog = GitHubDialog(None, self.manager)
+        dialog.token_input.setText("token")
+        created_repo = GitHubRepo(
+            "meu/novo-repo",
+            "https://github.com/meu/novo-repo",
+            "https://github.com/meu/novo-repo.git",
+            True,
+            0,
+            0,
+            0,
+            "main",
+        )
+        calls: list[dict[str, object]] = []
+
+        class FakeClient:
+            def __init__(self, token: str) -> None:
+                self.token = token
+
+            def create_repository(self, repo_name: str, *, private: bool, description: str = "", auto_init: bool = False):
+                calls.append(
+                    {
+                        "repo_name": repo_name,
+                        "private": private,
+                        "description": description,
+                        "auto_init": auto_init,
+                    }
+                )
+                return created_repo
+
+            def list_repositories(self):
+                return [created_repo]
+
+        def run_now(function, on_result, failure_prefix="Falha"):
+            on_result(function())
+
+        with (
+            patch("orbit_control.ui.GitHubClient", FakeClient),
+            patch.object(
+                dialog,
+                "_new_repo_options",
+                return_value={
+                    "name": "novo-repo",
+                    "private": True,
+                    "description": "Repo criado pelo Orbit",
+                    "auto_init": True,
+                },
+            ),
+            patch.object(dialog, "_submit_github_task", side_effect=run_now),
+        ):
+            dialog.create_new_repo()
+
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "repo_name": "novo-repo",
+                    "private": True,
+                    "description": "Repo criado pelo Orbit",
+                    "auto_init": True,
+                }
+            ],
+        )
+        self.assertEqual(dialog.repo_combo.currentText(), "meu/novo-repo")
+        self.assertEqual(dialog.repo_list.count(), 1)
+        self.assertEqual(dialog.selected_repo_label.toolTip(), "meu/novo-repo")
+        dialog.deleteLater()
+
+    def test_github_dialog_reflows_between_wide_and_narrow_layouts(self) -> None:
+        dialog = GitHubDialog(None, self.manager)
+
+        def position(widget):
+            return dialog.github_content_layout.getItemPosition(dialog.github_content_layout.indexOf(widget))
+
+        dialog.github_scroll.resize(1000, 760)
+        dialog._apply_github_layout(force=True)
+        self.assertEqual(position(dialog.left_panel)[:2], (0, 0))
+        self.assertEqual(position(dialog.right_panel)[:2], (0, 1))
+
+        dialog.github_scroll.resize(720, 620)
+        dialog._apply_github_layout(force=True)
+        self.assertEqual(position(dialog.left_panel)[:2], (0, 0))
+        self.assertEqual(position(dialog.right_panel)[:2], (1, 0))
+        dialog.deleteLater()
+
+    def test_service_card_autostart_toggle_persists(self) -> None:
+        service = ServiceConfig(name="Demo", target=str(self.script), working_directory=str(self.root))
+        self.manager.add_service(service)
+        window = MainWindow(self.manager)
+        window.refresh_timer.stop()
+        window._apply_snapshots(self.manager.snapshots())
+        card = window.cards_layout.itemAtPosition(0, 0).widget()
+        assert card is not None
+        toggles = [item for item in card.findChildren(QCheckBox) if item.property("startupToggle")]
+
+        self.assertEqual(len(toggles), 1)
+        self.assertFalse(toggles[0].isChecked())
+        toggles[0].setChecked(True)
+        window.thread_pool.waitForDone(1000)
+
+        self.assertTrue(self.manager.get_service(service.id).autostart)
+        window._closing = True
+        window.thread_pool.waitForDone(1000)
+        window.deleteLater()
+
+    def test_compact_mode_shows_command_list_and_survives_restart(self) -> None:
+        service = ServiceConfig(
+            name="Demo",
+            target=str(self.script),
+            working_directory=str(self.root),
+            arguments="--port 5050",
+        )
+        self.manager.add_service(service)
+        window = MainWindow(self.manager)
+        window.refresh_timer.stop()
+        window._apply_snapshots(self.manager.snapshots())
+
+        window.toggle_compact_mode(True)
+
+        row = window.cards_layout.itemAtPosition(0, 0).widget()
+        assert row is not None
+        command_labels = [item for item in row.findChildren(QLabel) if item.property("compactCommand")]
+        self.assertTrue(window._compact_mode)
+        self.assertTrue(window.compact_button.isChecked())
+        self.assertTrue(window.stats_host.isHidden())
+        self.assertTrue(row.property("compactRow"))
+        self.assertEqual(self.manager.storage.load_preferences()["compact_mode"], True)
+        self.assertIn(str(self.script), command_labels[0].toolTip())
+        self.assertIn("--port 5050", command_labels[0].toolTip())
+
+        window._closing = True
+        window.thread_pool.waitForDone(1000)
+        window.deleteLater()
+
+        restored = MainWindow(self.manager)
+        restored.refresh_timer.stop()
+        self.assertTrue(restored._compact_mode)
+        self.assertTrue(restored.compact_button.isChecked())
+        restored._closing = True
+        restored.thread_pool.waitForDone(1000)
+        restored.deleteLater()
 
     def test_theme_toggle_changes_icon_and_survives_restart(self) -> None:
         window = MainWindow(self.manager)
@@ -251,6 +632,19 @@ class DesktopTests(unittest.TestCase):
         dialog._save()
         assert dialog.result_config is not None
         self.assertTrue(dialog.result_config.install_requirements)
+        dialog.deleteLater()
+
+    def test_service_dialog_detects_type_from_target_text(self) -> None:
+        batch = self.root / "INICIAR.bat"
+        batch.write_text("@echo off\necho READY\n", encoding="utf-8")
+        dialog = ServiceDialog(None)
+        dialog.target_input.setText(str(batch))
+        dialog._autodetect_kind_from_target()
+
+        self.assertEqual(dialog.kind_combo.currentData(), "batch")
+        dialog.target_input.setText(str(self.script))
+        dialog._autodetect_kind_from_target()
+        self.assertEqual(dialog.kind_combo.currentData(), "python")
         dialog.deleteLater()
 
     def test_service_dialog_accepts_and_autofills_batch_file(self) -> None:

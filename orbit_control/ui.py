@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QMimeData, QObject, QPoint, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import (
+    QAction,
     QDesktopServices,
     QDrag,
     QDragEnterEvent,
@@ -29,24 +32,39 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLayout,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QSplitter,
     QStatusBar,
     QStyle,
+    QSystemTrayIcon,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from . import __version__
+from .github_tools import (
+    GitHubClient,
+    GitHubError,
+    GitHubRepo,
+    infer_repo_name,
+    service_project_directory,
+    summarize_repositories,
+    upload_project_to_github,
+)
 from .models import ServiceConfig, ServiceSnapshot
 from .node_tools import (
     default_package_script,
@@ -83,6 +101,7 @@ ACTION_ICONS = {
     "stop": QStyle.StandardPixmap.SP_MediaStop,
     "restart": QStyle.StandardPixmap.SP_BrowserReload,
     "logs": QStyle.StandardPixmap.SP_FileDialogDetailedView,
+    "edit": QStyle.StandardPixmap.SP_FileDialogContentsView,
     "delete": QStyle.StandardPixmap.SP_DialogDiscardButton,
 }
 
@@ -90,8 +109,9 @@ ACTION_ICONS = {
 LIGHT_STYLESHEET = """
 QWidget {
     color: #172033;
-    font-family: "Segoe UI", "Inter", sans-serif;
+    font-family: "Inter", "Segoe UI Variable", "Segoe UI", "Arial", sans-serif;
     font-size: 10pt;
+    letter-spacing: 0;
 }
 QMainWindow, QDialog, QWidget#root {
     background: #f6f7fb;
@@ -116,7 +136,7 @@ QToolButton[nav="true"] {
     color: #64748b;
     background: transparent;
     border: 0;
-    border-radius: 10px;
+    border-radius: 8px;
     padding: 0 12px;
     font-weight: 600;
 }
@@ -127,6 +147,13 @@ QToolButton[nav="true"]:hover {
 QToolButton[nav="true"]:checked {
     color: #4338ca;
     background: #e0e7ff;
+}
+QToolButton[nav="true"][danger="true"] {
+    color: #b42318;
+}
+QToolButton[nav="true"][danger="true"]:hover {
+    color: #b42318;
+    background: #fff5f4;
 }
 QToolButton[dragHandle="true"] {
     color: #98a2b3;
@@ -156,7 +183,7 @@ QLineEdit, QComboBox, QSpinBox, QPlainTextEdit {
     color: #1d2939;
     background: #ffffff;
     border: 1px solid #d9dfeb;
-    border-radius: 10px;
+    border-radius: 8px;
     padding: 8px 11px;
     selection-background-color: #c7d2fe;
 }
@@ -174,7 +201,7 @@ QPushButton {
     color: #344054;
     background: #ffffff;
     border: 1px solid #d0d5dd;
-    border-radius: 10px;
+    border-radius: 8px;
     padding: 8px 14px;
     font-weight: 600;
 }
@@ -231,7 +258,19 @@ QToolButton:disabled, QPushButton:disabled {
 QFrame[statCard="true"], QFrame[serviceCard="true"], QFrame#bulkBar, QFrame#emptyState {
     background: #ffffff;
     border: 1px solid #e4e7ec;
-    border-radius: 14px;
+    border-radius: 8px;
+}
+QFrame[compactRow="true"] {
+    background: #ffffff;
+    border: 1px solid #e4e7ec;
+    border-radius: 8px;
+}
+QFrame[compactRow="true"]:hover {
+    border-color: #c7d2fe;
+}
+QFrame[compactRow="true"][selected="true"] {
+    background: #fafaff;
+    border: 2px solid #818cf8;
 }
 QFrame[serviceCard="true"]:hover {
     border-color: #c7d2fe;
@@ -285,6 +324,23 @@ QLabel[path="true"] {
     background: #f8fafc;
     border-radius: 7px;
     padding: 6px 8px;
+}
+QLabel[compactCommand="true"] {
+    color: #475467;
+    background: #f8fafc;
+    border: 1px solid #eef1f5;
+    border-radius: 7px;
+    padding: 6px 8px;
+}
+QCheckBox[startupToggle="true"] {
+    color: #344054;
+    font-weight: 700;
+    spacing: 7px;
+}
+QCheckBox[startupToggle="true"]::indicator,
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
 }
 QLabel[status="running"] {
     color: #027a48;
@@ -351,6 +407,30 @@ QScrollArea {
     background: transparent;
     border: 0;
 }
+QFrame#githubRepoSidebar {
+    background: #ffffff;
+    border: 1px solid #e4e7ec;
+    border-radius: 8px;
+}
+QListWidget#githubRepoList {
+    color: #263247;
+    background: #ffffff;
+    border: 1px solid #e4e7ec;
+    border-radius: 8px;
+    outline: 0;
+}
+QListWidget#githubRepoList::item {
+    min-height: 34px;
+    padding: 7px 9px;
+    border-bottom: 1px solid #f0f2f6;
+}
+QListWidget#githubRepoList::item:selected {
+    color: #ffffff;
+    background: #4f46e5;
+}
+QSplitter::handle {
+    background: transparent;
+}
 QScrollBar:vertical {
     background: transparent;
     width: 10px;
@@ -415,6 +495,11 @@ QToolButton[nav="true"]:hover,
 QToolButton[nav="true"]:checked {
     color: #c7d2fe;
     background: #252844;
+}
+QToolButton[nav="true"][danger="true"],
+QToolButton[nav="true"][danger="true"]:hover {
+    color: #fda29b;
+    background: #321d22;
 }
 QToolButton[dragHandle="true"] {
     color: #70798b;
@@ -490,14 +575,16 @@ QToolButton:disabled, QPushButton:disabled {
     background: #181b22;
     border-color: #292e38;
 }
-QFrame[statCard="true"], QFrame[serviceCard="true"], QFrame#bulkBar, QFrame#emptyState {
+QFrame[statCard="true"], QFrame[serviceCard="true"], QFrame[compactRow="true"], QFrame#bulkBar, QFrame#emptyState {
     background: #171b24;
     border-color: #2d3441;
 }
-QFrame[serviceCard="true"]:hover {
+QFrame[serviceCard="true"]:hover,
+QFrame[compactRow="true"]:hover {
     border-color: #5551a6;
 }
-QFrame[serviceCard="true"][selected="true"] {
+QFrame[serviceCard="true"][selected="true"],
+QFrame[compactRow="true"][selected="true"] {
     background: #20213a;
     border-color: #818cf8;
 }
@@ -528,6 +615,14 @@ QLabel[path="true"], QFrame[metric="true"] {
     color: #aeb6c5;
     background: #1d222c;
     border-color: #292f3a;
+}
+QLabel[compactCommand="true"] {
+    color: #b7bfcc;
+    background: #1d222c;
+    border-color: #292f3a;
+}
+QCheckBox[startupToggle="true"] {
+    color: #d8dee9;
 }
 QLabel[metricLabel="true"] {
     color: #8993a5;
@@ -562,6 +657,22 @@ QPushButton[port="true"] {
 QScrollBar::handle:vertical {
     background: #465064;
 }
+QFrame#githubRepoSidebar {
+    background: #171b24;
+    border-color: #303745;
+}
+QListWidget#githubRepoList {
+    color: #d8dee9;
+    background: #11141b;
+    border-color: #303745;
+}
+QListWidget#githubRepoList::item {
+    border-bottom-color: #242a35;
+}
+QListWidget#githubRepoList::item:selected {
+    color: #ffffff;
+    background: #5551d6;
+}
 QGroupBox {
     color: #d8dee9;
     background: #171b24;
@@ -584,6 +695,22 @@ QToolTip {
 DESKTOP_STYLESHEET = LIGHT_STYLESHEET
 
 SERVICE_MIME_TYPE = "application/x-orbit-service-id"
+PROJECTS_DIR = Path(r"E:\my_projects")
+
+
+def service_command_text(service: ServiceConfig) -> str:
+    arguments = service.arguments.strip()
+    if service.kind == "node":
+        manager = service.package_manager if service.package_manager != "auto" else "auto"
+        command = service.package_command.strip() or "dev"
+        first = command.split(maxsplit=1)[0].casefold() if command else ""
+        text = command if first in {"npm", "pnpm", "yarn", "bun", "corepack"} else f"{manager} {command}"
+        return f"{text}  |  {service.target}"
+    if service.kind == "python":
+        text = f"python -u {service.target}"
+    else:
+        text = service.target
+    return f"{text} {arguments}".strip()
 
 
 class WorkerSignals(QObject):
@@ -774,15 +901,15 @@ class CardsHost(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._cards: list[ServiceCard] = []
+        self._cards: list[QWidget] = []
         self.setAcceptDrops(True)
 
-    def set_cards(self, cards: list[ServiceCard]) -> None:
+    def set_cards(self, cards: list[QWidget]) -> None:
         self._cards = cards
         self._clear_drop_target()
 
     @staticmethod
-    def _set_drop_target(card: ServiceCard, enabled: bool) -> None:
+    def _set_drop_target(card: QWidget, enabled: bool) -> None:
         if bool(card.property("dropTarget")) == enabled:
             return
         card.setProperty("dropTarget", enabled)
@@ -845,6 +972,7 @@ class ServiceCard(QFrame):
         snapshot: ServiceSnapshot,
         selected: bool,
         on_select: Callable[[str, bool], None],
+        on_autostart: Callable[[str, bool], None],
         on_action: Callable[[str, str], None],
         on_logs: Callable[[str], None],
         on_edit: Callable[[ServiceConfig], None],
@@ -896,7 +1024,17 @@ class ServiceCard(QFrame):
         status = QLabel(f"{status_symbol}  {status_label}")
         status.setProperty("status", snapshot.status)
         status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        header.addWidget(status, 0, Qt.AlignmentFlag.AlignTop)
+        quick_flags = QVBoxLayout()
+        quick_flags.setSpacing(6)
+        quick_flags.addWidget(status, 0, Qt.AlignmentFlag.AlignRight)
+
+        startup_toggle = QCheckBox("Auto")
+        startup_toggle.setProperty("startupToggle", True)
+        startup_toggle.setChecked(service.autostart)
+        startup_toggle.setToolTip("Iniciar este serviÃ§o quando o Orbit Control abrir")
+        startup_toggle.toggled.connect(lambda checked: on_autostart(service.id, checked))
+        quick_flags.addWidget(startup_toggle, 0, Qt.AlignmentFlag.AlignRight)
+        header.addLayout(quick_flags)
         root.addLayout(header)
 
         metrics = QGridLayout()
@@ -965,7 +1103,10 @@ class ServiceCard(QFrame):
         )
         log_button.clicked.connect(lambda checked=False: on_logs(service.id))
         footer.addWidget(log_button)
-        edit_button = IconButton(*ACTION_META["edit"])
+        edit_button = IconButton(
+            *ACTION_META["edit"],
+            icon=self.style().standardIcon(ACTION_ICONS["edit"]),
+        )
         edit_button.clicked.connect(lambda checked=False: on_edit(replace(service)))
         footer.addWidget(edit_button)
         delete_button = IconButton(
@@ -983,6 +1124,104 @@ class ServiceCard(QFrame):
             error.setWordWrap(True)
             error.setToolTip(snapshot.last_error)
             root.addWidget(error)
+
+
+class CompactServiceRow(QFrame):
+    def __init__(
+        self,
+        snapshot: ServiceSnapshot,
+        selected: bool,
+        on_select: Callable[[str, bool], None],
+        on_autostart: Callable[[str, bool], None],
+        on_action: Callable[[str, str], None],
+        on_logs: Callable[[str], None],
+        on_edit: Callable[[ServiceConfig], None],
+        on_delete: Callable[[str], None],
+    ) -> None:
+        super().__init__()
+        self.setProperty("compactRow", True)
+        self.setProperty("serviceId", snapshot.config.id)
+        self.setProperty("selected", selected)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumHeight(56)
+        service = snapshot.config
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(12, 8, 12, 8)
+        root.setSpacing(9)
+
+        checkbox = QCheckBox()
+        checkbox.setChecked(selected)
+        checkbox.setToolTip("Selecionar para acoes em massa")
+        checkbox.toggled.connect(lambda checked: on_select(service.id, checked))
+        root.addWidget(checkbox)
+
+        startup_toggle = QCheckBox("Auto")
+        startup_toggle.setProperty("startupToggle", True)
+        startup_toggle.setChecked(service.autostart)
+        startup_toggle.setToolTip("Iniciar este servico quando o Orbit Control abrir")
+        startup_toggle.toggled.connect(lambda checked: on_autostart(service.id, checked))
+        root.addWidget(startup_toggle)
+
+        name = ElidedLabel(service.name)
+        name.setProperty("serviceName", True)
+        name.setMinimumWidth(120)
+        root.addWidget(name, 1)
+
+        command = ElidedLabel(service_command_text(service), Qt.TextElideMode.ElideMiddle)
+        command.setProperty("compactCommand", True)
+        command.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        root.addWidget(command, 2)
+
+        status_label, status_symbol = STATUS_META.get(snapshot.status, STATUS_META["stopped"])
+        status = QLabel(status_symbol)
+        status.setProperty("status", snapshot.status)
+        status.setToolTip(status_label)
+        status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        status.setFixedWidth(32)
+        root.addWidget(status)
+
+        def action_button(action: str, tone: str = "neutral") -> IconButton:
+            symbol, tooltip = ACTION_META[action]
+            button = IconButton(
+                symbol,
+                tooltip,
+                tone,
+                icon=self.style().standardIcon(ACTION_ICONS[action]),
+            )
+            button.clicked.connect(lambda checked=False, selected_action=action: on_action(service.id, selected_action))
+            return button
+
+        if snapshot.status in {"stopped", "crashed", "error"}:
+            root.addWidget(action_button("start", "positive"))
+        elif snapshot.status == "paused":
+            root.addWidget(action_button("resume", "positive"))
+            root.addWidget(action_button("stop", "danger"))
+        else:
+            root.addWidget(action_button("pause", "warning"))
+            root.addWidget(action_button("stop", "danger"))
+
+        log_button = IconButton(
+            *ACTION_META["logs"],
+            icon=self.style().standardIcon(ACTION_ICONS["logs"]),
+        )
+        log_button.clicked.connect(lambda checked=False: on_logs(service.id))
+        root.addWidget(log_button)
+
+        edit_button = IconButton(
+            *ACTION_META["edit"],
+            icon=self.style().standardIcon(ACTION_ICONS["edit"]),
+        )
+        edit_button.clicked.connect(lambda checked=False: on_edit(replace(service)))
+        root.addWidget(edit_button)
+
+        delete_button = IconButton(
+            *ACTION_META["delete"],
+            tone="danger",
+            icon=self.style().standardIcon(ACTION_ICONS["delete"]),
+        )
+        delete_button.clicked.connect(lambda checked=False: on_delete(service.id))
+        root.addWidget(delete_button)
 
 
 class ServiceDialog(QDialog):
@@ -1047,6 +1286,9 @@ class ServiceDialog(QDialog):
         self.target_input = QLineEdit(model.target)
         self.target_input.setPlaceholderText("Selecione uma pasta Node, package.json, .py, .bat, .exe...")
         form.addWidget(self.target_input, 3, 1)
+        self._target_kind_timer = QTimer(self)
+        self._target_kind_timer.setSingleShot(True)
+        self._target_kind_timer.timeout.connect(self._autodetect_kind_from_target)
         self.browse_target_button = IconButton("…", "Procurar arquivo ou projeto")
         self.browse_target_button.clicked.connect(self._choose_target)
         form.addWidget(self.browse_target_button, 3, 2)
@@ -1186,6 +1428,7 @@ class ServiceDialog(QDialog):
         content_layout.addWidget(self.advanced_group)
         content_layout.addStretch()
 
+        self.target_input.textChanged.connect(lambda: self._target_kind_timer.start(220))
         self.target_input.editingFinished.connect(self._autofill_from_target)
         self.workdir_input.editingFinished.connect(self._update_type_controls)
         self.python_input.textChanged.connect(self._update_python_hint)
@@ -1265,6 +1508,19 @@ class ServiceDialog(QDialog):
         if filename:
             self.package_manager_executable_input.setText(filename)
             self._refresh_node_options()
+
+    def _autodetect_kind_from_target(self) -> None:
+        target = self.target_input.text().strip()
+        if not target:
+            return
+        inferred_kind = infer_service_kind(target)
+        index = self.kind_combo.findData(inferred_kind)
+        if index >= 0 and index != self.kind_combo.currentIndex():
+            self.kind_combo.setCurrentIndex(index)
+        else:
+            self._update_type_controls()
+        if inferred_kind == "node" and self.existing is None:
+            self._refresh_node_options(select_default=True)
 
     def _autofill_from_target(self) -> None:
         target = self.target_input.text().strip()
@@ -1504,6 +1760,1184 @@ class LogDialog(QDialog):
         self.refresh()
 
 
+class GitHubDialog(QDialog):
+    def __init__(self, parent: QWidget, manager: ProcessManager) -> None:
+        super().__init__(parent)
+        self.manager = manager
+        self.thread_pool = QThreadPool(self)
+        self.thread_pool.setMaxThreadCount(2)
+        self._workers: set[Worker] = set()
+        self.client: GitHubClient | None = None
+        self.repos: list[GitHubRepo] = []
+        self._connected = False
+        self._github_login = ""
+        self._suppress_connection_change = False
+        self._busy_depth = 0
+        self._github_layout_wide: bool | None = None
+        self.setWindowTitle("GitHub")
+        self.resize(1240, 780)
+        self.setMinimumSize(920, 620)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 18)
+        root.setSpacing(14)
+
+        header = QHBoxLayout()
+        heading = QVBoxLayout()
+        heading.setSpacing(1)
+        title = QLabel("GitHub")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel("Conecte, suba apps, atualize repos e acompanhe stats.")
+        subtitle.setProperty("muted", True)
+        heading.addWidget(title)
+        heading.addWidget(subtitle)
+        header.addLayout(heading, 1)
+        self.close_button = QPushButton("Fechar")
+        self.close_button.clicked.connect(self.accept)
+        header.addWidget(self.close_button)
+        root.addLayout(header)
+
+        self.github_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.github_splitter.setChildrenCollapsible(False)
+        root.addWidget(self.github_splitter, 1)
+
+        self.repo_sidebar = QFrame()
+        self.repo_sidebar.setObjectName("githubRepoSidebar")
+        self.repo_sidebar.setMinimumWidth(260)
+        self.repo_sidebar.setMaximumWidth(360)
+        repo_sidebar_layout = QVBoxLayout(self.repo_sidebar)
+        repo_sidebar_layout.setContentsMargins(14, 14, 14, 14)
+        repo_sidebar_layout.setSpacing(10)
+
+        repo_title_row = QHBoxLayout()
+        repo_title = QLabel("Repos")
+        repo_title.setObjectName("pageTitle")
+        repo_title_row.addWidget(repo_title)
+        repo_title_row.addStretch()
+        self.repo_total_label = QLabel("0")
+        self.repo_total_label.setProperty("muted", True)
+        repo_title_row.addWidget(self.repo_total_label)
+        repo_sidebar_layout.addLayout(repo_title_row)
+
+        self.repo_filter_input = QLineEdit()
+        self.repo_filter_input.setPlaceholderText("Buscar repo")
+        self.repo_filter_input.setMinimumHeight(36)
+        self.repo_filter_input.textChanged.connect(self._refresh_repo_list)
+        repo_sidebar_layout.addWidget(self.repo_filter_input)
+
+        self.repo_list = QListWidget()
+        self.repo_list.setObjectName("githubRepoList")
+        self.repo_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.repo_list.currentItemChanged.connect(self._repo_list_changed)
+        repo_sidebar_layout.addWidget(self.repo_list, 1)
+
+        self.selected_repo_label = ElidedLabel("Nenhum repo selecionado")
+        self.selected_repo_label.setProperty("serviceName", True)
+        repo_sidebar_layout.addWidget(self.selected_repo_label)
+        self.selected_repo_meta_label = QLabel("Conecte para carregar os repositorios.")
+        self.selected_repo_meta_label.setProperty("muted", True)
+        self.selected_repo_meta_label.setWordWrap(True)
+        repo_sidebar_layout.addWidget(self.selected_repo_meta_label)
+
+        repo_action_grid = QGridLayout()
+        repo_action_grid.setContentsMargins(0, 0, 0, 0)
+        repo_action_grid.setHorizontalSpacing(8)
+        repo_action_grid.setVerticalSpacing(8)
+        self.create_repo_button = QPushButton("Criar repo")
+        self.create_repo_button.setProperty("primary", True)
+        self.create_repo_button.clicked.connect(self.create_new_repo)
+        self.use_repo_button = QPushButton("Usar")
+        self.use_repo_button.clicked.connect(self.use_selected_repo)
+        self.open_repo_button = QPushButton("Abrir")
+        self.open_repo_button.clicked.connect(self.open_selected_repo)
+        self.update_repo_button = QPushButton("Atualizar")
+        self.update_repo_button.clicked.connect(self.update_selected_repo)
+        self.delete_repo_button = QPushButton("Excluir")
+        self.delete_repo_button.setProperty("danger", True)
+        self.delete_repo_button.clicked.connect(self.delete_selected_repo)
+        for button in (
+            self.create_repo_button,
+            self.use_repo_button,
+            self.open_repo_button,
+            self.update_repo_button,
+            self.delete_repo_button,
+        ):
+            button.setMinimumHeight(34)
+        repo_action_grid.addWidget(self.create_repo_button, 0, 0, 1, 2)
+        repo_action_grid.addWidget(self.use_repo_button, 1, 0)
+        repo_action_grid.addWidget(self.open_repo_button, 1, 1)
+        repo_action_grid.addWidget(self.update_repo_button, 2, 0)
+        repo_action_grid.addWidget(self.delete_repo_button, 2, 1)
+        repo_sidebar_layout.addLayout(repo_action_grid)
+        self.github_splitter.addWidget(self.repo_sidebar)
+
+        self.github_scroll = QScrollArea()
+        self.github_scroll.setWidgetResizable(True)
+        self.github_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.github_content = QWidget()
+        self.github_content_layout = QGridLayout(self.github_content)
+        self.github_content_layout.setContentsMargins(0, 0, 0, 0)
+        self.github_content_layout.setHorizontalSpacing(14)
+        self.github_content_layout.setVerticalSpacing(14)
+        self.github_scroll.setWidget(self.github_content)
+        self.github_splitter.addWidget(self.github_scroll)
+        self.github_splitter.setStretchFactor(0, 0)
+        self.github_splitter.setStretchFactor(1, 1)
+        self.github_splitter.setSizes([300, 760])
+
+        self.left_panel = QWidget()
+        self.left_layout = QVBoxLayout(self.left_panel)
+        self.left_layout.setContentsMargins(0, 0, 0, 0)
+        self.left_layout.setSpacing(14)
+        self.right_panel = QWidget()
+        self.right_layout = QVBoxLayout(self.right_panel)
+        self.right_layout.setContentsMargins(0, 0, 0, 0)
+        self.right_layout.setSpacing(14)
+
+        connection_group = QGroupBox("Conexao")
+        connection_layout = QGridLayout(connection_group)
+        connection_layout.setContentsMargins(16, 20, 16, 14)
+        connection_layout.setHorizontalSpacing(12)
+        connection_layout.setVerticalSpacing(10)
+        connection_layout.setColumnMinimumWidth(0, 74)
+        connection_layout.setColumnStretch(1, 1)
+        connection_layout.addWidget(QLabel("Conta"), 0, 0)
+        self.connection_combo = QComboBox()
+        self.connection_combo.setMinimumHeight(38)
+        self.connection_combo.setMaxVisibleItems(12)
+        self.connection_combo.currentIndexChanged.connect(self._saved_connection_changed)
+        connection_layout.addWidget(self.connection_combo, 0, 1, 1, 4)
+
+        connection_layout.addWidget(QLabel("Token"), 1, 0)
+        self.token_input = QLineEdit(self._saved_token())
+        self.token_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.token_input.setPlaceholderText("github_pat_... ou ghp_...")
+        self.token_input.setMinimumHeight(38)
+        connection_layout.addWidget(self.token_input, 1, 1, 1, 4)
+
+        self.account_label = QLabel("Desconectado")
+        self.account_label.setProperty("muted", True)
+        connection_layout.addWidget(self.account_label, 2, 1, 1, 4)
+
+        self.connect_button = QPushButton("Conectar")
+        self.connect_button.setProperty("primary", True)
+        self.connect_button.clicked.connect(self.connect_github)
+        self.save_token_button = QPushButton("Salvar conexao")
+        self.save_token_button.clicked.connect(self.save_token)
+        self.clear_token_button = QPushButton("Limpar campo")
+        self.clear_token_button.clicked.connect(self.token_input.clear)
+        self.delete_token_button = QPushButton("Excluir conexao")
+        self.delete_token_button.setProperty("danger", True)
+        self.delete_token_button.clicked.connect(self.delete_saved_token)
+        connection_buttons = QHBoxLayout()
+        connection_buttons.setSpacing(10)
+        for button in (
+            self.connect_button,
+            self.save_token_button,
+            self.clear_token_button,
+            self.delete_token_button,
+        ):
+            button.setMinimumHeight(38)
+            button.setMinimumWidth(118)
+            connection_buttons.addWidget(button)
+        connection_buttons.setStretch(0, 1)
+        connection_layout.addLayout(connection_buttons, 3, 1, 1, 4)
+
+        config_buttons = QHBoxLayout()
+        config_buttons.setSpacing(10)
+        self.export_github_config_button = QPushButton("Exportar JSON")
+        self.export_github_config_button.clicked.connect(self.export_github_settings)
+        self.import_github_config_button = QPushButton("Importar JSON")
+        self.import_github_config_button.clicked.connect(self.import_github_settings)
+        for button in (self.export_github_config_button, self.import_github_config_button):
+            button.setMinimumHeight(36)
+            button.setMinimumWidth(132)
+            config_buttons.addWidget(button)
+        config_buttons.addStretch()
+        connection_layout.addLayout(config_buttons, 4, 1, 1, 4)
+        self.left_layout.addWidget(connection_group)
+
+        actions_group = QGroupBox("Apps e repos")
+        actions_layout = QGridLayout(actions_group)
+        actions_layout.setContentsMargins(16, 20, 16, 14)
+        actions_layout.setHorizontalSpacing(12)
+        actions_layout.setVerticalSpacing(10)
+        actions_layout.setColumnMinimumWidth(0, 74)
+        actions_layout.setColumnStretch(1, 1)
+        actions_layout.addWidget(QLabel("App local"), 0, 0)
+        self.app_combo = QComboBox()
+        self.app_combo.setEditable(True)
+        self.app_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.app_combo.setPlaceholderText("App cadastrado ou caminho livre")
+        self.app_combo.setMinimumHeight(38)
+        self.app_combo.setMinimumContentsLength(34)
+        self.app_combo.setMaxVisibleItems(18)
+        self._populate_apps()
+        self.app_combo.currentIndexChanged.connect(self._sync_repo_name)
+        if self.app_combo.lineEdit():
+            self.app_combo.lineEdit().editingFinished.connect(lambda: self._sync_repo_name(force=True))
+        actions_layout.addWidget(self.app_combo, 0, 1, 1, 2)
+        self.browse_project_button = QPushButton("Procurar")
+        self.browse_project_button.clicked.connect(self.browse_local_project)
+        self.browse_project_button.setMinimumHeight(38)
+        self.browse_project_button.setMinimumWidth(112)
+        actions_layout.addWidget(self.browse_project_button, 0, 3)
+        self.refresh_apps_button = QPushButton("Atualizar lista")
+        self.refresh_apps_button.clicked.connect(self._populate_apps)
+        self.refresh_apps_button.setMinimumHeight(38)
+        self.refresh_apps_button.setMinimumWidth(124)
+        actions_layout.addWidget(self.refresh_apps_button, 0, 4)
+        self.app_hint_label = QLabel("Escolha um app cadastrado ou procure uma pasta que ainda nao esta no Orbit.")
+        self.app_hint_label.setProperty("muted", True)
+        actions_layout.addWidget(self.app_hint_label, 1, 1, 1, 4)
+
+        actions_layout.addWidget(QLabel("Repo"), 2, 0)
+        self.repo_combo = QComboBox()
+        self.repo_combo.setEditable(True)
+        self.repo_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.repo_combo.setMaxVisibleItems(18)
+        self.repo_combo.setMinimumHeight(38)
+        self.repo_combo.setMinimumContentsLength(40)
+        self.repo_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.repo_combo.view().setMinimumWidth(520)
+        self.repo_combo.setPlaceholderText("usuario/repositorio ou novo-repo")
+        actions_layout.addWidget(self.repo_combo, 2, 1, 1, 4)
+        self.repo_count_label = QLabel("Conecte ao GitHub para carregar seus repos.")
+        self.repo_count_label.setProperty("muted", True)
+        actions_layout.addWidget(self.repo_count_label, 3, 1, 1, 4)
+
+        self.private_check = QCheckBox("Privado")
+        self.create_repo_check = QCheckBox("Criar se nao existir")
+        self.create_repo_check.setChecked(True)
+        actions_layout.addWidget(self.private_check, 4, 1)
+        actions_layout.addWidget(self.create_repo_check, 4, 2, 1, 3)
+
+        actions_layout.addWidget(QLabel("Commit"), 5, 0)
+        self.commit_input = QLineEdit("Atualiza app pelo Orbit Control")
+        self.commit_input.setMinimumHeight(38)
+        actions_layout.addWidget(self.commit_input, 5, 1, 1, 4)
+
+        self.upload_button = QPushButton("Subir novo")
+        self.upload_button.setProperty("primary", True)
+        self.upload_button.clicked.connect(lambda: self.upload_selected_app(create_missing=True))
+        self.update_button = QPushButton("Atualizar")
+        self.update_button.clicked.connect(lambda: self.upload_selected_app(create_missing=False))
+        self.stats_button = QPushButton("Stats")
+        self.stats_button.clicked.connect(self.load_stats)
+        for button in (self.upload_button, self.update_button, self.stats_button):
+            button.setEnabled(False)
+            button.setMinimumHeight(38)
+            button.setMinimumWidth(126)
+        action_buttons = QHBoxLayout()
+        action_buttons.setSpacing(10)
+        action_buttons.addWidget(self.upload_button)
+        action_buttons.addWidget(self.update_button)
+        action_buttons.addWidget(self.stats_button)
+        action_buttons.addStretch()
+        actions_layout.addLayout(action_buttons, 6, 1, 1, 4)
+        self.left_layout.addWidget(actions_group)
+        self.left_layout.addStretch()
+
+        stats_group = QGroupBox("Stats")
+        stats_layout = QGridLayout(stats_group)
+        stats_layout.setContentsMargins(16, 20, 16, 14)
+        stats_layout.setHorizontalSpacing(10)
+        stats_layout.setVerticalSpacing(7)
+        self.stats_labels = {
+            "repos": QLabel("0"),
+            "public": QLabel("0"),
+            "private": QLabel("0"),
+            "stars": QLabel("0"),
+            "forks": QLabel("0"),
+            "issues": QLabel("0"),
+        }
+        for index, (key, label) in enumerate(
+            (
+                ("repos", "Repos"),
+                ("public", "Publicos"),
+                ("private", "Privados"),
+                ("stars", "Stars"),
+                ("forks", "Forks"),
+                ("issues", "Issues"),
+            )
+        ):
+            caption = QLabel(label)
+            caption.setProperty("muted", True)
+            stats_layout.addWidget(caption, index // 3 * 2, index % 3)
+            value = self.stats_labels[key]
+            value.setObjectName("pageTitle")
+            stats_layout.addWidget(value, index // 3 * 2 + 1, index % 3)
+        self.right_layout.addWidget(stats_group)
+
+        events_group = QGroupBox("Eventos")
+        events_layout = QVBoxLayout(events_group)
+        events_layout.setContentsMargins(16, 20, 16, 14)
+        events_layout.setSpacing(8)
+        self.output = QPlainTextEdit()
+        self.output.setReadOnly(True)
+        self.output.setMaximumBlockCount(400)
+        self.output.setMinimumHeight(220)
+        self.output.setPlaceholderText("Eventos do GitHub aparecem aqui.")
+        events_layout.addWidget(self.output)
+        self.right_layout.addWidget(events_group, 1)
+        self._sync_repo_name()
+        self._apply_github_layout(force=True)
+        self._populate_saved_connections()
+        self._load_github_ui_preferences()
+        self._update_controls()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._apply_github_layout()
+
+    def _apply_github_layout(self, *, force: bool = False) -> None:
+        if not hasattr(self, "github_content_layout"):
+            return
+        if hasattr(self, "github_scroll"):
+            content_width = max(self.github_scroll.width(), self.github_scroll.viewport().width())
+        else:
+            content_width = self.width()
+        wide = content_width >= 960
+        if self._github_layout_wide == wide and not force:
+            return
+        self._github_layout_wide = wide
+
+        while self.github_content_layout.count():
+            self.github_content_layout.takeAt(0)
+        for column in range(2):
+            self.github_content_layout.setColumnStretch(column, 0)
+            self.github_content_layout.setColumnMinimumWidth(column, 0)
+
+        if wide:
+            self.github_content_layout.addWidget(self.left_panel, 0, 0)
+            self.github_content_layout.addWidget(self.right_panel, 0, 1)
+            self.github_content_layout.setColumnStretch(0, 3)
+            self.github_content_layout.setColumnStretch(1, 2)
+            self.github_content_layout.setRowStretch(0, 1)
+            self.github_content_layout.setRowStretch(1, 0)
+            self.left_panel.setMinimumWidth(520)
+            self.right_panel.setMinimumWidth(320)
+            return
+
+        self.github_content_layout.addWidget(self.left_panel, 0, 0)
+        self.github_content_layout.addWidget(self.right_panel, 1, 0)
+        self.github_content_layout.setColumnStretch(0, 1)
+        self.github_content_layout.setRowStretch(0, 0)
+        self.github_content_layout.setRowStretch(1, 1)
+        self.left_panel.setMinimumWidth(0)
+        self.right_panel.setMinimumWidth(0)
+
+    def _saved_token(self) -> str:
+        preferences = self.manager.storage.load_preferences()
+        active = str(preferences.get("github_active_connection", ""))
+        for connection in self._saved_connections(preferences):
+            if connection["login"] == active:
+                return connection["token"]
+        connections = self._saved_connections(preferences)
+        if connections:
+            return connections[0]["token"]
+        return str(preferences.get("github_token", ""))
+
+    def _saved_connections(self, preferences: dict[str, Any] | None = None) -> list[dict[str, str]]:
+        preferences = preferences if preferences is not None else self.manager.storage.load_preferences()
+        raw = preferences.get("github_connections", [])
+        connections: list[dict[str, str]] = []
+        seen: set[str] = set()
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                login = str(item.get("login") or "").strip()
+                token = str(item.get("token") or "").strip()
+                if not login or not token or login in seen:
+                    continue
+                connections.append(
+                    {
+                        "login": login,
+                        "token": token,
+                        "saved_at": str(item.get("saved_at") or ""),
+                    }
+                )
+                seen.add(login)
+        legacy_token = str(preferences.get("github_token", "")).strip()
+        if legacy_token and not connections:
+            connections.append({"login": "Token salvo", "token": legacy_token, "saved_at": ""})
+        return connections
+
+    @staticmethod
+    def _connection_label(connection: dict[str, str]) -> str:
+        token = connection["token"]
+        masked = f"{token[:6]}...{token[-4:]}" if len(token) > 12 else "***"
+        return f"{connection['login']} | {masked}"
+
+    def _populate_saved_connections(self) -> None:
+        if not hasattr(self, "connection_combo"):
+            return
+        preferences = self.manager.storage.load_preferences()
+        active = str(preferences.get("github_active_connection", ""))
+        token = self.token_input.text().strip() if hasattr(self, "token_input") else self._saved_token()
+        self._suppress_connection_change = True
+        self.connection_combo.clear()
+        self.connection_combo.addItem("Inserir token manual", "")
+        selected_index = 0
+        for connection in self._saved_connections(preferences):
+            self.connection_combo.addItem(self._connection_label(connection), connection["login"])
+            if connection["login"] == active or (token and connection["token"] == token):
+                selected_index = self.connection_combo.count() - 1
+        self.connection_combo.setCurrentIndex(selected_index)
+        self._suppress_connection_change = False
+        if selected_index > 0:
+            self._saved_connection_changed(selected_index)
+
+    def _saved_connection_changed(self, index: int) -> None:
+        if self._suppress_connection_change:
+            return
+        login = str(self.connection_combo.itemData(index) or "")
+        if not login:
+            return
+        connection = next((item for item in self._saved_connections() if item["login"] == login), None)
+        if not connection:
+            return
+        self.token_input.setText(connection["token"])
+        self._github_login = connection["login"]
+        self.account_label.setText(f"Conta salva: {connection['login']}")
+
+    def _save_github_connection(self, login: str, token: str) -> None:
+        login = login.strip()
+        token = token.strip()
+        if not login or not token:
+            raise GitHubError("Nao foi possivel salvar a conexao sem usuario e token.")
+        preferences = self.manager.storage.load_preferences()
+        connections = [item for item in self._saved_connections(preferences) if item["login"] != login]
+        connections.append({"login": login, "token": token, "saved_at": datetime.now().isoformat(timespec="seconds")})
+        preferences["github_connections"] = sorted(connections, key=lambda item: item["login"].casefold())
+        preferences["github_active_connection"] = login
+        preferences["github_token"] = token
+        self.manager.storage.save_preferences(preferences)
+        self._github_login = login
+        self._populate_saved_connections()
+
+    def _load_github_ui_preferences(self) -> None:
+        settings = self.manager.storage.load_preferences().get("github_ui", {})
+        if not isinstance(settings, dict):
+            return
+        app_text = str(settings.get("app", "")).strip()
+        repo_text = str(settings.get("repo", "")).strip()
+        commit_message = str(settings.get("commit_message", "")).strip()
+        if app_text:
+            self.app_combo.setEditText(app_text)
+        if repo_text:
+            self.repo_combo.setEditText(repo_text)
+        if commit_message:
+            self.commit_input.setText(commit_message)
+        if "private" in settings:
+            self.private_check.setChecked(bool(settings["private"]))
+        if "create_missing" in settings:
+            self.create_repo_check.setChecked(bool(settings["create_missing"]))
+
+    def _github_ui_settings(self) -> dict[str, Any]:
+        return {
+            "app": self.app_combo.currentText().strip(),
+            "repo": self.repo_combo.currentText().strip(),
+            "private": self.private_check.isChecked(),
+            "create_missing": self.create_repo_check.isChecked(),
+            "commit_message": self.commit_input.text().strip(),
+        }
+
+    def _github_settings_payload(self) -> dict[str, Any]:
+        preferences = self.manager.storage.load_preferences()
+        return {
+            "format": "orbit-control-github-settings",
+            "version": 1,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "github": {
+                "connections": self._saved_connections(preferences),
+                "active_connection": str(preferences.get("github_active_connection", "")),
+                "current_token": self.token_input.text().strip(),
+                "ui": self._github_ui_settings(),
+            },
+        }
+
+    def _apply_github_settings_payload(self, payload: dict[str, Any]) -> None:
+        if payload.get("format") != "orbit-control-github-settings":
+            raise GitHubError("JSON de configuracao do GitHub invalido.")
+        github = payload.get("github", {})
+        if not isinstance(github, dict):
+            raise GitHubError("JSON de configuracao do GitHub invalido.")
+        raw_connections = github.get("connections", [])
+        if not isinstance(raw_connections, list):
+            raise GitHubError("Lista de conexoes invalida.")
+        connections: list[dict[str, str]] = []
+        for item in raw_connections:
+            if not isinstance(item, dict):
+                continue
+            login = str(item.get("login") or "").strip()
+            token = str(item.get("token") or "").strip()
+            if login and token:
+                connections.append(
+                    {
+                        "login": login,
+                        "token": token,
+                        "saved_at": str(item.get("saved_at") or ""),
+                    }
+                )
+        active = str(github.get("active_connection") or "").strip()
+        current_token = str(github.get("current_token") or "").strip()
+        ui_settings = github.get("ui", {})
+        if not isinstance(ui_settings, dict):
+            ui_settings = {}
+
+        preferences = self.manager.storage.load_preferences()
+        preferences["github_connections"] = connections
+        if active:
+            preferences["github_active_connection"] = active
+        else:
+            preferences.pop("github_active_connection", None)
+        if current_token:
+            preferences["github_token"] = current_token
+        elif active:
+            active_connection = next((item for item in connections if item["login"] == active), None)
+            if active_connection:
+                preferences["github_token"] = active_connection["token"]
+        preferences["github_ui"] = ui_settings
+        self.manager.storage.save_preferences(preferences)
+
+        self._populate_saved_connections()
+        if current_token:
+            self.token_input.setText(current_token)
+        self._load_github_ui_preferences()
+        self._append_output("Configuracoes do GitHub importadas.")
+
+    def _github_settings_initial_dir(self) -> Path:
+        return PROJECTS_DIR if PROJECTS_DIR.exists() else Path.home()
+
+    def export_github_settings(self) -> None:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        default_path = self._github_settings_initial_dir() / f"orbit-control-github-{stamp}.json"
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Salvar configuracoes do GitHub",
+            str(default_path),
+            "GitHub JSON (*.json);;Todos os arquivos (*.*)",
+        )
+        if not filename:
+            return
+        path = Path(filename)
+        if path.suffix.casefold() != ".json":
+            path = path.with_suffix(".json")
+        try:
+            with path.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(self._github_settings_payload(), handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+        except OSError as exc:
+            QMessageBox.warning(self, "GitHub", str(exc))
+            return
+        self._append_output(f"Configuracoes exportadas: {path}")
+
+    def import_github_settings(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Importar configuracoes do GitHub",
+            str(self._github_settings_initial_dir()),
+            "GitHub JSON (*.json);;Todos os arquivos (*.*)",
+        )
+        if not filename:
+            return
+        try:
+            with Path(filename).open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if not isinstance(payload, dict):
+                raise GitHubError("JSON de configuracao do GitHub invalido.")
+            self._apply_github_settings_payload(payload)
+        except (OSError, json.JSONDecodeError, GitHubError) as exc:
+            QMessageBox.warning(self, "GitHub", str(exc))
+
+    def _set_busy(self, busy: bool) -> None:
+        if busy:
+            if self._busy_depth == 0:
+                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self._busy_depth += 1
+        else:
+            if self._busy_depth == 0:
+                return
+            self._busy_depth -= 1
+            if self._busy_depth == 0:
+                QApplication.restoreOverrideCursor()
+        self._update_controls()
+
+    def _update_controls(self) -> None:
+        busy = self._busy_depth > 0
+        for widget in (
+            self.connection_combo,
+            self.token_input,
+            self.connect_button,
+            self.save_token_button,
+            self.clear_token_button,
+            self.delete_token_button,
+            self.export_github_config_button,
+            self.import_github_config_button,
+            self.close_button,
+            self.repo_filter_input,
+            self.repo_list,
+            self.app_combo,
+            self.browse_project_button,
+            self.refresh_apps_button,
+            self.repo_combo,
+            self.private_check,
+            self.create_repo_check,
+            self.commit_input,
+        ):
+            widget.setEnabled(not busy)
+        for button in (self.upload_button, self.update_button, self.stats_button):
+            button.setEnabled(self._connected and not busy)
+        self.create_repo_button.setEnabled(self._connected and not busy)
+        repo_selected = self._selected_repo() is not None
+        for button in (self.use_repo_button, self.open_repo_button, self.update_repo_button, self.delete_repo_button):
+            button.setEnabled(self._connected and repo_selected and not busy)
+
+    def _submit_github_task(
+        self,
+        function: Callable[[], Any],
+        on_result: Callable[[Any], None],
+        failure_prefix: str = "Falha",
+    ) -> None:
+        self._set_busy(True)
+        worker = Worker(function)
+        self._workers.add(worker)
+        worker.signals.result.connect(on_result)
+        worker.signals.error.connect(lambda error: self._github_task_error(error, failure_prefix))
+        worker.signals.finished.connect(lambda selected=worker: self._github_task_finished(selected))
+        self.thread_pool.start(worker)
+
+    def _github_task_error(self, error: str, failure_prefix: str) -> None:
+        QMessageBox.warning(self, "GitHub", error)
+        self._append_output(f"{failure_prefix}: {error}")
+
+    def _github_task_finished(self, worker: Worker) -> None:
+        self._workers.discard(worker)
+        self._set_busy(False)
+
+    def closeEvent(self, event) -> None:
+        if self._workers:
+            QMessageBox.information(self, "GitHub", "Aguarde a tarefa atual terminar.")
+            event.ignore()
+            return
+        self.thread_pool.waitForDone(1000)
+        super().closeEvent(event)
+
+    def _append_output(self, text: str) -> None:
+        self.output.appendPlainText(text)
+        self.output.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _populate_apps(self) -> None:
+        current_text = self.app_combo.currentText().strip() if hasattr(self, "app_combo") else ""
+        current_index = self.app_combo.currentIndex() if hasattr(self, "app_combo") else -1
+        current_id = None
+        if current_index >= 0 and current_text == self.app_combo.itemText(current_index):
+            current_id = self.app_combo.currentData()
+        self.app_combo.blockSignals(True)
+        self.app_combo.clear()
+        for service in self.manager.list_services():
+            self.app_combo.addItem(service.name, service.id)
+        if current_id:
+            index = self.app_combo.findData(current_id)
+            if index >= 0:
+                self.app_combo.setCurrentIndex(index)
+        elif current_text:
+            self.app_combo.setEditText(current_text)
+        elif self.app_combo.count():
+            self.app_combo.setCurrentIndex(0)
+        self.app_combo.blockSignals(False)
+        self._sync_repo_name()
+
+    def _selected_service(self) -> ServiceConfig:
+        text = self.app_combo.currentText().strip().strip('"')
+        service_id = self.app_combo.currentData()
+        current_index = self.app_combo.currentIndex()
+        if service_id and current_index >= 0 and text == self.app_combo.itemText(current_index):
+            return self.manager.get_service(str(service_id))
+        if text:
+            return self._service_from_local_project(text)
+        if service_id:
+            return self.manager.get_service(str(service_id))
+        raise GitHubError("Selecione um app cadastrado ou informe a pasta do projeto.")
+
+    def _service_from_local_project(self, value: str) -> ServiceConfig:
+        path = Path(value.strip().strip('"')).expanduser()
+        if not path.exists():
+            raise GitHubError(f"Pasta ou arquivo nao encontrado:\n{path}")
+        if path.is_dir():
+            target = path
+            workdir = path
+        else:
+            target = path
+            workdir = path.parent
+        name = infer_service_name(str(target)) or workdir.name or target.stem
+        return ServiceConfig(
+            name=name,
+            target=str(target),
+            kind=infer_service_kind(str(target)),  # type: ignore[arg-type]
+            working_directory=str(workdir),
+        )
+
+    def _sync_repo_name(self, *args: Any, force: bool = False) -> None:
+        if not hasattr(self, "repo_combo"):
+            return
+        if self.repo_combo.currentText().strip() and not force:
+            return
+        try:
+            self.repo_combo.setEditText(infer_repo_name(self._selected_service()))
+        except (GitHubError, ServiceError):
+            pass
+
+    def browse_local_project(self) -> None:
+        initial_dir = PROJECTS_DIR if PROJECTS_DIR.exists() else Path.home()
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Escolher projeto local",
+            str(initial_dir),
+        )
+        if not selected:
+            return
+        self.app_combo.setEditText(selected)
+        self.app_hint_label.setText(f"Projeto livre: {selected}")
+        self._sync_repo_name(force=True)
+
+    def _token(self) -> str:
+        token = self.token_input.text().strip()
+        if not token:
+            raise GitHubError("Informe o token do GitHub.")
+        return token
+
+    def _client(self) -> GitHubClient:
+        if self.client is None or self.client.token != self._token():
+            self.client = GitHubClient(self._token())
+        return self.client
+
+    def save_token(self) -> None:
+        try:
+            token = self._token()
+        except GitHubError as exc:
+            QMessageBox.warning(self, "GitHub", str(exc))
+            return
+        if self._github_login:
+            try:
+                self._save_github_connection(self._github_login, token)
+            except GitHubError as exc:
+                QMessageBox.warning(self, "GitHub", str(exc))
+                return
+            self._append_output(f"Conexao salva: {self._github_login}.")
+            return
+        self._append_output("Validando token para salvar conexao...")
+
+        def task() -> dict[str, str]:
+            client = GitHubClient(token)
+            user = client.current_user()
+            login = str(user.get("login") or "").strip()
+            if not login:
+                raise GitHubError("Nao foi possivel identificar o usuario do GitHub.")
+            return {"login": login, "token": token}
+
+        def done(result: dict[str, str]) -> None:
+            try:
+                self._save_github_connection(result["login"], result["token"])
+            except GitHubError as exc:
+                QMessageBox.warning(self, "GitHub", str(exc))
+                return
+            self.account_label.setText(f"Conta salva: {result['login']}")
+            self._append_output(f"Conexao salva: {result['login']}.")
+
+        self._submit_github_task(task, done, "Falha ao salvar conexao")
+
+    def delete_saved_token(self) -> None:
+        preferences = self.manager.storage.load_preferences()
+        selected_login = str(self.connection_combo.currentData() or "")
+        if selected_login:
+            preferences["github_connections"] = [
+                item
+                for item in self._saved_connections(preferences)
+                if item["login"] != selected_login
+            ]
+            if preferences.get("github_active_connection") == selected_login:
+                preferences.pop("github_active_connection", None)
+        preferences.pop("github_token", None)
+        self.manager.storage.save_preferences(preferences)
+        self.token_input.clear()
+        self.client = None
+        self._connected = False
+        self.repos = []
+        self.repo_combo.clear()
+        self.repo_list.clear()
+        self.repo_total_label.setText("0")
+        self.repo_count_label.setText("Conecte ao GitHub para carregar seus repos.")
+        self.selected_repo_label.set_full_text("Nenhum repo selecionado")
+        self.selected_repo_meta_label.setText("Conecte para carregar os repositorios.")
+        self.account_label.setText("Desconectado")
+        self._github_login = ""
+        self._populate_saved_connections()
+        self._update_controls()
+        self._append_output("Conexao salva removida.")
+
+    def connect_github(self) -> None:
+        try:
+            token = self._token()
+        except GitHubError as exc:
+            QMessageBox.warning(self, "GitHub", str(exc))
+            return
+        self._append_output("Conectando ao GitHub...")
+
+        def task() -> dict[str, Any]:
+            client = GitHubClient(token)
+            user = client.current_user()
+            repos = client.list_repositories()
+            return {
+                "client": client,
+                "login": user.get("login") or "usuario",
+                "repos": repos,
+                "stats": summarize_repositories(repos),
+            }
+
+        def done(result: dict[str, Any]) -> None:
+            client = result["client"]
+            login = result["login"]
+            self.client = client
+            self._connected = True
+            self._github_login = str(login)
+            self.account_label.setText(f"Conectado como {login}")
+            self._append_output(f"Conectado como {login}.")
+            self._apply_stats(result["repos"], result["stats"])
+            self._update_controls()
+
+        self._submit_github_task(task, done, "Falha ao conectar")
+
+    def _apply_stats(self, repos: list[GitHubRepo], stats: dict[str, int]) -> None:
+        self.repos = repos
+        self._refresh_repo_choices()
+        for key, value in stats.items():
+            if key in self.stats_labels:
+                self.stats_labels[key].setText(str(value))
+
+    def load_stats(self) -> None:
+        try:
+            token = self._token()
+        except GitHubError as exc:
+            QMessageBox.warning(self, "GitHub", str(exc))
+            return
+        self._append_output("Atualizando stats...")
+
+        def task() -> tuple[list[GitHubRepo], dict[str, int]]:
+            client = GitHubClient(token)
+            repos = client.list_repositories()
+            return repos, summarize_repositories(repos)
+
+        def done(result: tuple[list[GitHubRepo], dict[str, int]]) -> None:
+            repos, stats = result
+            self._connected = True
+            self._apply_stats(repos, stats)
+            self._append_output("Stats atualizados.")
+            self._update_controls()
+
+        self._submit_github_task(task, done, "Falha ao atualizar stats")
+
+    def _refresh_repo_choices(self) -> None:
+        current = self.repo_combo.currentText().strip()
+        repo_names = sorted((repo.full_name for repo in self.repos if repo.full_name), key=str.casefold)
+        self.repo_combo.blockSignals(True)
+        self.repo_combo.clear()
+        self.repo_combo.addItems(repo_names)
+        if current and current in repo_names:
+            self.repo_combo.setCurrentIndex(repo_names.index(current))
+        elif current:
+            self.repo_combo.setEditText(current)
+        elif repo_names:
+            self.repo_combo.setCurrentIndex(0)
+        if repo_names:
+            self.repo_combo.setToolTip("\n".join(repo_names))
+            self.repo_count_label.setText(f"{len(repo_names)} repo(s) carregado(s) no dropdown.")
+        else:
+            self.repo_combo.setToolTip("")
+            self.repo_count_label.setText("Nenhum repo encontrado. Digite um nome para criar um novo.")
+        self.repo_combo.blockSignals(False)
+        self._refresh_repo_list()
+
+    def _repo_by_full_name(self, full_name: str) -> GitHubRepo | None:
+        return next((repo for repo in self.repos if repo.full_name == full_name), None)
+
+    def _selected_repo(self) -> GitHubRepo | None:
+        item = self.repo_list.currentItem()
+        if not item:
+            return None
+        return self._repo_by_full_name(str(item.data(Qt.ItemDataRole.UserRole)))
+
+    def _refresh_repo_list(self, *_args: Any) -> None:
+        if not hasattr(self, "repo_list"):
+            return
+        selected_name = str(self.repo_list.currentItem().data(Qt.ItemDataRole.UserRole)) if self.repo_list.currentItem() else ""
+        if not selected_name:
+            selected_name = self.repo_combo.currentText().strip()
+        query = self.repo_filter_input.text().strip().casefold()
+        repos = sorted((repo for repo in self.repos if repo.full_name), key=lambda repo: repo.full_name.casefold())
+
+        self.repo_list.blockSignals(True)
+        self.repo_list.clear()
+        for repo in repos:
+            if query and query not in repo.full_name.casefold():
+                continue
+            item = QListWidgetItem(repo.full_name)
+            item.setData(Qt.ItemDataRole.UserRole, repo.full_name)
+            visibility = "Privado" if repo.private else "Publico"
+            item.setToolTip(
+                f"{visibility}\nStars: {repo.stargazers_count}\nForks: {repo.forks_count}\nIssues: {repo.open_issues_count}"
+            )
+            self.repo_list.addItem(item)
+        self.repo_list.blockSignals(False)
+
+        self.repo_total_label.setText(f"{self.repo_list.count()}/{len(repos)}")
+        if selected_name and self._select_repo_in_list(selected_name):
+            return
+        if self.repo_list.count() and not self.repo_list.currentItem():
+            self.repo_list.setCurrentRow(0)
+        else:
+            self._repo_list_changed(self.repo_list.currentItem(), None)
+
+    def _select_repo_in_list(self, full_name: str) -> bool:
+        for index in range(self.repo_list.count()):
+            item = self.repo_list.item(index)
+            if str(item.data(Qt.ItemDataRole.UserRole)) == full_name:
+                self.repo_list.setCurrentRow(index)
+                return True
+        self.repo_list.clearSelection()
+        self.repo_list.setCurrentRow(-1)
+        self._repo_list_changed(None, None)
+        return False
+
+    def _repo_list_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None = None) -> None:
+        repo = None
+        if current:
+            repo = self._repo_by_full_name(str(current.data(Qt.ItemDataRole.UserRole)))
+        if not repo:
+            self.selected_repo_label.set_full_text("Nenhum repo selecionado")
+            self.selected_repo_meta_label.setText("Selecione um repo da lista para trabalhar nele.")
+            self._update_controls()
+            return
+
+        self.repo_combo.setEditText(repo.full_name)
+        self.private_check.setChecked(repo.private)
+        visibility = "Privado" if repo.private else "Publico"
+        self.selected_repo_label.set_full_text(repo.full_name)
+        self.selected_repo_meta_label.setText(
+            f"{visibility} | Stars {repo.stargazers_count} | Forks {repo.forks_count} | Issues {repo.open_issues_count}"
+        )
+        self._update_controls()
+
+    def use_selected_repo(self) -> None:
+        repo = self._selected_repo()
+        if not repo:
+            return
+        self.repo_combo.setEditText(repo.full_name)
+        self._append_output(f"Repo selecionado: {repo.full_name}")
+
+    def _new_repo_options(self) -> dict[str, Any] | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Criar repo")
+        dialog.setMinimumWidth(460)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(10)
+        form.setColumnStretch(1, 1)
+
+        default_name = ""
+        try:
+            default_name = infer_repo_name(self._selected_service())
+        except (GitHubError, ServiceError):
+            pass
+
+        name_input = QLineEdit(default_name)
+        name_input.setPlaceholderText("nome-do-repo ou org/nome-do-repo")
+        form.addWidget(QLabel("Nome"), 0, 0)
+        form.addWidget(name_input, 0, 1)
+
+        visibility_combo = QComboBox()
+        visibility_combo.addItem("Publico", False)
+        visibility_combo.addItem("Privado", True)
+        form.addWidget(QLabel("Tipo"), 1, 0)
+        form.addWidget(visibility_combo, 1, 1)
+
+        description_input = QLineEdit()
+        description_input.setPlaceholderText("Descricao opcional")
+        form.addWidget(QLabel("Descricao"), 2, 0)
+        form.addWidget(description_input, 2, 1)
+
+        readme_check = QCheckBox("Criar README inicial")
+        form.addWidget(readme_check, 3, 1)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+        create_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        create_button.setText("Criar")
+        create_button.setProperty("primary", True)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Cancelar")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        name = name_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "GitHub", "Informe o nome do repo.")
+            return None
+        return {
+            "name": name,
+            "private": bool(visibility_combo.currentData()),
+            "description": description_input.text().strip(),
+            "auto_init": readme_check.isChecked(),
+        }
+
+    def create_new_repo(self) -> None:
+        try:
+            token = self._token()
+        except GitHubError as exc:
+            QMessageBox.warning(self, "GitHub", str(exc))
+            return
+        options = self._new_repo_options()
+        if not options:
+            return
+        repo_name = str(options["name"])
+        visibility = "privado" if options["private"] else "publico"
+        self._append_output(f"Criando repo {repo_name} ({visibility})...")
+
+        def task() -> dict[str, Any]:
+            client = GitHubClient(token)
+            repo = client.create_repository(
+                repo_name,
+                private=bool(options["private"]),
+                description=str(options["description"]),
+                auto_init=bool(options["auto_init"]),
+            )
+            repos = client.list_repositories()
+            return {
+                "client": client,
+                "repo": repo,
+                "repos": repos,
+                "stats": summarize_repositories(repos),
+            }
+
+        def done(result: dict[str, Any]) -> None:
+            repo = result["repo"]
+            self.client = result["client"]
+            self._connected = True
+            self._apply_stats(result["repos"], result["stats"])
+            self.repo_combo.setEditText(repo.full_name)
+            self._select_repo_in_list(repo.full_name)
+            self._append_output(f"Repo criado: {repo.full_name}")
+            self._update_controls()
+
+        self._submit_github_task(task, done, "Falha ao criar repo")
+
+    def open_selected_repo(self) -> None:
+        repo = self._selected_repo()
+        if repo and repo.html_url:
+            QDesktopServices.openUrl(QUrl(repo.html_url))
+
+    def update_selected_repo(self) -> None:
+        repo = self._selected_repo()
+        if not repo:
+            return
+        self.repo_combo.setEditText(repo.full_name)
+        self.upload_selected_app(create_missing=False)
+
+    def delete_selected_repo(self) -> None:
+        repo = self._selected_repo()
+        if not repo:
+            return
+        try:
+            token = self._token()
+        except GitHubError as exc:
+            QMessageBox.warning(self, "GitHub", str(exc))
+            return
+        typed, confirmed = QInputDialog.getText(
+            self,
+            "Excluir repo?",
+            f"Digite {repo.full_name} para excluir este repo do GitHub:",
+        )
+        if not confirmed:
+            return
+        if typed.strip() != repo.full_name:
+            QMessageBox.warning(self, "GitHub", "Nome diferente. O repo nao foi excluido.")
+            return
+        self._append_output(f"Excluindo repo {repo.full_name}...")
+
+        def task() -> dict[str, Any]:
+            client = GitHubClient(token)
+            client.delete_repository(repo.full_name)
+            repos = client.list_repositories()
+            return {
+                "client": client,
+                "repo_name": repo.full_name,
+                "repos": repos,
+                "stats": summarize_repositories(repos),
+            }
+
+        def done(result: dict[str, Any]) -> None:
+            self.client = result["client"]
+            self._connected = True
+            self._append_output(f"Repo excluido: {result['repo_name']}")
+            self._apply_stats(result["repos"], result["stats"])
+            self._update_controls()
+
+        self._submit_github_task(task, done, "Falha ao excluir repo")
+
+    def upload_selected_app(self, *, create_missing: bool) -> None:
+        try:
+            service = self._selected_service()
+            token = self._token()
+            repo_name = self.repo_combo.currentText().strip() or infer_repo_name(service)
+            should_create = create_missing or self.create_repo_check.isChecked()
+            project_dir = service_project_directory(service)
+            private = self.private_check.isChecked()
+            commit_message = self.commit_input.text().strip()
+        except (GitHubError, ServiceError) as exc:
+            QMessageBox.warning(self, "GitHub", str(exc))
+            return
+        self._append_output(f"Enviando {service.name}...")
+
+        def task() -> dict[str, Any]:
+            client = GitHubClient(token)
+            repo = client.ensure_repository(
+                repo_name,
+                private=private,
+                create_missing=should_create,
+            )
+            url = upload_project_to_github(
+                project_dir,
+                repo,
+                token,
+                commit_message,
+            )
+            repos = client.list_repositories()
+            return {
+                "client": client,
+                "service_name": service.name,
+                "url": url,
+                "repos": repos,
+                "stats": summarize_repositories(repos),
+            }
+
+        def done(result: dict[str, Any]) -> None:
+            self.client = result["client"]
+            self._connected = True
+            self._append_output(f"App enviado: {result['service_name']} -> {result['url']}")
+            self._apply_stats(result["repos"], result["stats"])
+            self._update_controls()
+
+        self._submit_github_task(task, done, "Falha ao enviar")
+
+
 class MainWindow(QMainWindow):
     def __init__(self, manager: ProcessManager) -> None:
         super().__init__()
@@ -1520,14 +2954,23 @@ class MainWindow(QMainWindow):
         self._deferred_snapshots: list[ServiceSnapshot] | None = None
         self._last_columns = 0
         self._responsive_signature: tuple[Any, ...] = ()
-        saved_theme = str(self.manager.storage.load_preferences().get("theme", "light"))
+        self._force_close = False
+        self._hidden_to_tray = False
+        self.tray_icon: QSystemTrayIcon | None = None
+        preferences = self.manager.storage.load_preferences()
+        saved_theme = str(preferences.get("theme", "light"))
         self._theme = saved_theme if saved_theme in {"light", "dark"} else "light"
+        self._compact_mode = bool(preferences.get("compact_mode", False))
 
         self.setWindowTitle(f"Orbit Control {__version__}")
         self.resize(1240, 780)
         self.setMinimumSize(720, 560)
         self.setStyleSheet(self._theme_stylesheet())
         self._build_ui()
+        self._build_tray_icon()
+        application = QApplication.instance()
+        if application:
+            application.setQuitOnLastWindowClosed(False)
 
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
@@ -1579,6 +3022,13 @@ class MainWindow(QMainWindow):
         log_button = self._nav_button(QStyle.StandardPixmap.SP_FileDialogDetailedView, "Log geral", "Log geral")
         log_button.clicked.connect(self.open_system_log)
         sidebar_layout.addWidget(log_button)
+        projects_button = self._nav_button(
+            QStyle.StandardPixmap.SP_DirHomeIcon,
+            "Abrir E:\\my_projects",
+            "Meus projetos",
+        )
+        projects_button.clicked.connect(self.open_projects_folder)
+        sidebar_layout.addWidget(projects_button)
         folder_button = self._nav_button(
             QStyle.StandardPixmap.SP_DirOpenIcon,
             "Abrir pasta de dados e logs",
@@ -1586,7 +3036,37 @@ class MainWindow(QMainWindow):
         )
         folder_button.clicked.connect(self.open_data_folder)
         sidebar_layout.addWidget(folder_button)
+        export_button = self._nav_button(
+            QStyle.StandardPixmap.SP_ArrowDown,
+            "Baixar backup dos apps",
+            "Exportar",
+        )
+        export_button.clicked.connect(self.export_services_backup)
+        sidebar_layout.addWidget(export_button)
+        import_button = self._nav_button(
+            QStyle.StandardPixmap.SP_ArrowUp,
+            "Abrir backup dos apps",
+            "Importar",
+        )
+        import_button.clicked.connect(self.import_services_backup)
+        sidebar_layout.addWidget(import_button)
+        github_button = self._nav_button(
+            QStyle.StandardPixmap.SP_DriveNetIcon,
+            "GitHub",
+            "GitHub",
+        )
+        github_button.clicked.connect(self.open_github_panel)
+        sidebar_layout.addWidget(github_button)
         sidebar_layout.addStretch()
+        self.compact_button = self._nav_button(
+            QStyle.StandardPixmap.SP_FileDialogListView,
+            "Modo compacto",
+            "Compacto",
+        )
+        self.compact_button.setCheckable(True)
+        self.compact_button.setChecked(self._compact_mode)
+        self.compact_button.clicked.connect(self.toggle_compact_mode)
+        sidebar_layout.addWidget(self.compact_button)
         self.theme_button = QToolButton()
         self.theme_button.setProperty("nav", True)
         self.theme_button.setFixedHeight(44)
@@ -1594,6 +3074,14 @@ class MainWindow(QMainWindow):
         self.theme_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.theme_button.clicked.connect(self.toggle_theme)
         sidebar_layout.addWidget(self.theme_button)
+        self.reset_button = self._nav_button(
+            QStyle.StandardPixmap.SP_DialogResetButton,
+            "Resetar app",
+            "Resetar",
+        )
+        self.reset_button.setProperty("danger", True)
+        self.reset_button.clicked.connect(self.confirm_reset_app)
+        sidebar_layout.addWidget(self.reset_button)
         info_button = self._nav_button(
             QStyle.StandardPixmap.SP_MessageBoxInformation,
             f"Orbit Control {__version__}",
@@ -1644,6 +3132,8 @@ class MainWindow(QMainWindow):
 
         self.add_button = QPushButton("+  Novo serviço")
         self.add_button.setProperty("primary", True)
+        self.add_button.setText("Novo")
+        self.add_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogNewFolder))
         self.add_button.clicked.connect(lambda: self.open_service_dialog(None))
         self.body_layout.addWidget(self.header_panel)
 
@@ -1729,6 +3219,33 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status_bar)
         self._update_bulk_bar()
 
+    def _build_tray_icon(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        application = QApplication.instance()
+        icon = self.windowIcon()
+        if icon.isNull() and application:
+            icon = application.windowIcon()
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+
+        self.tray_icon = QSystemTrayIcon(icon, self)
+        self.tray_icon.setToolTip("Orbit Control")
+
+        tray_menu = QMenu(self)
+        restore_action = QAction("Abrir", self)
+        restore_action.triggered.connect(self.restore_from_tray)
+        exit_action = QAction("Sair", self)
+        exit_action.triggered.connect(self.exit_from_tray)
+        tray_menu.addAction(restore_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(exit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._tray_activated)
+        self.tray_icon.show()
+
     def _theme_stylesheet(self) -> str:
         return DARK_STYLESHEET if self._theme == "dark" else LIGHT_STYLESHEET
 
@@ -1754,6 +3271,94 @@ class MainWindow(QMainWindow):
         self._update_theme_button()
         label = "escuro" if self._theme == "dark" else "claro"
         self.statusBar().showMessage(f"Modo {label} ativado.", 2500)
+
+    def toggle_compact_mode(self, checked: bool | None = None) -> None:
+        self._compact_mode = self.compact_button.isChecked() if checked is None else bool(checked)
+        self.compact_button.setChecked(self._compact_mode)
+        preferences = self.manager.storage.load_preferences()
+        preferences["compact_mode"] = self._compact_mode
+        self.manager.storage.save_preferences(preferences)
+        self._responsive_signature = ()
+        self._apply_responsive_layout(force=True)
+        self._rebuild_cards()
+        label = "ativado" if self._compact_mode else "desativado"
+        self.statusBar().showMessage(f"Modo compacto {label}.", 2500)
+
+    def confirm_reset_app(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Resetar app")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(420)
+
+        root = QVBoxLayout(dialog)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(11)
+        title = QLabel("Resetar Orbit Control")
+        title.setObjectName("pageTitle")
+        message = QLabel(
+            "Todos os servicos, configuracoes, preferencias, runtime e logs da pasta de dados serao apagados."
+        )
+        message.setProperty("muted", True)
+        message.setWordWrap(True)
+        instruction = QLabel('Digite "RESETAR APP" para liberar a confirmacao.')
+        instruction.setProperty("muted", True)
+        confirmation_input = QLineEdit()
+        confirmation_input.setPlaceholderText("RESETAR APP")
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+        reset_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        reset_button.setText("Resetar")
+        reset_button.setProperty("danger", True)
+        reset_button.setEnabled(False)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Cancelar")
+
+        confirmation_input.textChanged.connect(lambda text: reset_button.setEnabled(text == "RESETAR APP"))
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        root.addWidget(title)
+        root.addWidget(message)
+        root.addWidget(instruction)
+        root.addWidget(confirmation_input)
+        root.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self.reset_button.setEnabled(False)
+        self.refresh_timer.stop()
+        self.statusBar().showMessage("Resetando app...")
+        self._submit(
+            self.manager.reset_all_data,
+            on_result=lambda _: self._reset_completed(),
+            on_error=self._reset_failed,
+        )
+
+    def _reset_completed(self) -> None:
+        self._selected.clear()
+        self._snapshots = []
+        self.search_input.clear()
+        self.status_combo.setCurrentIndex(0)
+        self._theme = "light"
+        self._compact_mode = False
+        self.compact_button.blockSignals(True)
+        self.compact_button.setChecked(False)
+        self.compact_button.blockSignals(False)
+        self.setStyleSheet(self._theme_stylesheet())
+        self._update_theme_button()
+        self._responsive_signature = ()
+        self._apply_responsive_layout(force=True)
+        self._apply_snapshots([])
+        self.reset_button.setEnabled(True)
+        if not self.refresh_timer.isActive():
+            self.refresh_timer.start(1600)
+        self.statusBar().showMessage("App resetado. Comecando do zero.", 4000)
+
+    def _reset_failed(self, message: str) -> None:
+        self.reset_button.setEnabled(True)
+        if not self.refresh_timer.isActive():
+            self.refresh_timer.start(1600)
+        self._show_error(message)
 
     @staticmethod
     def _detach_layout_items(layout: QGridLayout) -> None:
@@ -1786,8 +3391,17 @@ class MainWindow(QMainWindow):
         header_mode = "wide" if content_width >= 980 else "medium" if content_width >= 700 else "compact"
         stats_columns = 4 if content_width >= 760 else 2 if content_width >= 430 else 1
         bulk_mode = "inline" if content_width >= 760 else "stacked"
-        cards_columns = self._column_count_for_width(content_width)
-        signature = (expanded_sidebar, margins, header_mode, stats_columns, bulk_mode, cards_columns)
+        cards_columns = 1 if self._compact_mode else self._column_count_for_width(content_width)
+        self.stats_host.setVisible(not self._compact_mode)
+        signature = (
+            expanded_sidebar,
+            margins,
+            header_mode,
+            stats_columns,
+            bulk_mode,
+            cards_columns,
+            self._compact_mode,
+        )
         if signature == self._responsive_signature and not force:
             return
         self._responsive_signature = signature
@@ -1971,7 +3585,7 @@ class MainWindow(QMainWindow):
                 widget.deleteLater()
 
         snapshots = self._filtered_snapshots()
-        columns = self._column_count()
+        columns = 1 if self._compact_mode else self._column_count()
         self._last_columns = columns
         # Clear stretch left by a wider layout. Without this, a hidden third
         # column keeps one third of the viewport empty after the window shrinks.
@@ -2006,12 +3620,33 @@ class MainWindow(QMainWindow):
             self.cards_host.updateGeometry()
             return
 
-        cards: list[ServiceCard] = []
+        if self._compact_mode:
+            rows: list[QWidget] = []
+            for index, snapshot in enumerate(snapshots):
+                row = CompactServiceRow(
+                    snapshot,
+                    snapshot.config.id in self._selected,
+                    self._toggle_selection,
+                    self.set_service_autostart,
+                    self.run_action,
+                    self.open_service_log,
+                    self.open_service_dialog,
+                    self.delete_service,
+                )
+                self.cards_layout.addWidget(row, index, 0)
+                rows.append(row)
+            self.cards_host.set_cards(rows)
+            self.cards_layout.activate()
+            self.cards_host.updateGeometry()
+            return
+
+        cards: list[QWidget] = []
         for index, snapshot in enumerate(snapshots):
             card = ServiceCard(
                 snapshot,
                 snapshot.config.id in self._selected,
                 self._toggle_selection,
+                self.set_service_autostart,
                 self.run_action,
                 self.open_service_log,
                 self.open_service_dialog,
@@ -2112,6 +3747,21 @@ class MainWindow(QMainWindow):
         self.bulk_count.setText(f"{count} selecionado{'s' if count != 1 else ''}")
         for button in self.bulk_action_buttons:
             button.setEnabled(count > 0)
+
+    def set_service_autostart(self, service_id: str, enabled: bool) -> None:
+        service_name = next(
+            (snapshot.config.name for snapshot in self._snapshots if snapshot.config.id == service_id), service_id
+        )
+        label = "ativado" if enabled else "desativado"
+        self.statusBar().showMessage(f"Iniciar com o app {label}: {service_name}.")
+        self._submit(
+            self.manager.set_autostart,
+            service_id,
+            enabled,
+            on_result=lambda _: self.statusBar().showMessage(
+                f"Iniciar com o app {label}: {service_name}.", 3000
+            ),
+        )
 
     def run_action(self, service_id: str, action: str) -> None:
         if action not in {"start", "pause", "resume", "stop", "restart"}:
@@ -2219,8 +3869,69 @@ class MainWindow(QMainWindow):
         )
         dialog.exec()
 
+    def open_github_panel(self) -> None:
+        dialog = GitHubDialog(self, self.manager)
+        dialog.exec()
+
+    def open_projects_folder(self) -> None:
+        if not PROJECTS_DIR.exists():
+            QMessageBox.warning(self, "Orbit Control", f"Pasta nao encontrada:\n{PROJECTS_DIR}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(PROJECTS_DIR)))
+
     def open_data_folder(self) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.manager.storage.data_dir)))
+
+    def _backup_initial_dir(self) -> Path:
+        return PROJECTS_DIR if PROJECTS_DIR.exists() else Path.home()
+
+    def export_services_backup(self) -> None:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        default_path = self._backup_initial_dir() / f"orbit-control-apps-{stamp}.json"
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Salvar backup dos apps",
+            str(default_path),
+            "Backup JSON (*.json);;Todos os arquivos (*.*)",
+        )
+        if not filename:
+            return
+        path = Path(filename)
+        if path.suffix.casefold() != ".json":
+            path = path.with_suffix(".json")
+        try:
+            payload = self.manager.export_services_backup()
+            with path.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+        except (OSError, ServiceError) as exc:
+            QMessageBox.warning(self, "Backup nao salvo", str(exc))
+            return
+        total = len(payload.get("services", []))
+        self.statusBar().showMessage(f"Backup salvo com {total} app(s).", 4000)
+
+    def import_services_backup(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Abrir backup dos apps",
+            str(self._backup_initial_dir()),
+            "Backup JSON (*.json);;Todos os arquivos (*.*)",
+        )
+        if not filename:
+            return
+        try:
+            with Path(filename).open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            added, updated = self.manager.import_services_backup(payload)
+        except (json.JSONDecodeError, OSError, ServiceError) as exc:
+            QMessageBox.warning(self, "Backup nao importado", str(exc))
+            return
+        self._selected.clear()
+        self.refresh_async()
+        self.statusBar().showMessage(
+            f"Backup importado: {added} novo(s), {updated} atualizado(s).",
+            4500,
+        )
 
     def show_about(self) -> None:
         QMessageBox.information(
@@ -2231,9 +3942,115 @@ class MainWindow(QMainWindow):
             "Sem navegador, sem servidor web e sem localhost.",
         )
 
-    def closeEvent(self, event) -> None:
+    def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in {
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        }:
+            self.restore_from_tray()
+
+    def restore_from_tray(self) -> None:
+        self._hidden_to_tray = False
+        self.show()
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def exit_from_tray(self) -> None:
+        self._force_close = True
+        self.restore_from_tray()
+        self.close()
+
+    def _minimize_to_tray(self) -> None:
+        self._hidden_to_tray = True
+        if self.tray_icon and self.tray_icon.isVisible():
+            self.hide()
+            self.tray_icon.showMessage(
+                "Orbit Control",
+                "O app continua rodando. Use o icone da bandeja para abrir novamente.",
+                QSystemTrayIcon.MessageIcon.Information,
+                2500,
+            )
+            return
+        self.showMinimized()
+        self.statusBar().showMessage("Orbit Control minimizado.", 2500)
+
+    def _close_confirmation(self) -> str:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Fechar Orbit Control?")
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setText("O que deseja fazer?")
+        dialog.setInformativeText(
+            "Sair encerra todos os apps rodando. Minimizar mantem o Orbit Control ativo."
+        )
+        exit_button = dialog.addButton("Sair", QMessageBox.ButtonRole.DestructiveRole)
+        minimize_button = dialog.addButton("Minimizar", QMessageBox.ButtonRole.ActionRole)
+        cancel_button = dialog.addButton("Nao", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(cancel_button)
+        dialog.exec()
+
+        clicked = dialog.clickedButton()
+        if clicked == exit_button:
+            return "exit"
+        if clicked == minimize_button:
+            return "minimize"
+        return "cancel"
+
+    def _finalize_exit(self) -> bool:
+        self.statusBar().showMessage("Encerrando apps rodando...")
+        cursor_changed = False
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            cursor_changed = True
+            _success, errors = self.manager.stop_all_services()
+        finally:
+            if cursor_changed:
+                QApplication.restoreOverrideCursor()
+
+        if errors:
+            self.statusBar().showMessage("Nao foi possivel sair.", 5000)
+            QMessageBox.warning(
+                self,
+                "Nao foi possivel sair",
+                "Alguns apps nao puderam ser encerrados:\n\n" + "\n".join(errors[:8]),
+            )
+            if not self.refresh_timer.isActive():
+                self.refresh_timer.start(1600)
+            self._force_close = False
+            return False
+
         self._closing = True
         self.refresh_timer.stop()
         self.thread_pool.waitForDone(2000)
+        if self.tray_icon:
+            self.tray_icon.hide()
         self.manager.close()
-        event.accept()
+        application = QApplication.instance()
+        if application:
+            QTimer.singleShot(0, application.quit)
+        return True
+
+    def closeEvent(self, event) -> None:
+        if self._closing:
+            event.accept()
+            return
+
+        if self._force_close:
+            if self._finalize_exit():
+                event.accept()
+            else:
+                event.ignore()
+            return
+
+        choice = self._close_confirmation()
+        if choice == "exit":
+            if self._finalize_exit():
+                event.accept()
+            else:
+                event.ignore()
+            return
+        if choice == "minimize":
+            event.ignore()
+            self._minimize_to_tray()
+            return
+        event.ignore()

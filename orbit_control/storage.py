@@ -80,6 +80,20 @@ class JsonStorage:
         with self._lock:
             self._write_json(self.preferences_path, preferences)
 
+    def reset_all(self) -> None:
+        with self._lock:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            for child in self.data_dir.iterdir():
+                try:
+                    if child.is_dir():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+                except FileNotFoundError:
+                    pass
+            self.logs_dir.mkdir(exist_ok=True)
+            self.archive_dir.mkdir(exist_ok=True)
+
     def service_log_path(self, service_id: str) -> Path:
         return self.logs_dir / f"{service_id}.log"
 

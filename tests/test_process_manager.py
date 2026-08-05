@@ -75,6 +75,13 @@ class ProcessManagerTests(unittest.TestCase):
         self.assertEqual((success, errors), (1, []))
         self.assertEqual(self.manager.list_services(), [])
 
+    def test_stop_all_services_stops_every_configured_service(self) -> None:
+        with patch.object(self.manager, "bulk", return_value=(1, [])) as bulk:
+            result = self.manager.stop_all_services()
+
+        self.assertEqual(result, (1, []))
+        bulk.assert_called_once_with([self.service.id], "stop")
+
     def test_reorder_services_is_persisted(self) -> None:
         second = ServiceConfig(
             name="Second",
@@ -91,6 +98,50 @@ class ProcessManagerTests(unittest.TestCase):
         self.manager.close()
         self.manager = ProcessManager(self.root / "data")
         self.assertEqual([item.id for item in self.manager.list_services()], [second.id, self.service.id])
+
+    def test_set_autostart_persists_service_toggle(self) -> None:
+        self.assertFalse(self.manager.get_service(self.service.id).autostart)
+
+        self.manager.set_autostart(self.service.id, True)
+
+        self.assertTrue(self.manager.get_service(self.service.id).autostart)
+        self.manager.close()
+        self.manager = ProcessManager(self.root / "data")
+        self.assertTrue(self.manager.get_service(self.service.id).autostart)
+
+    def test_services_backup_exports_and_imports_services(self) -> None:
+        backup = self.manager.export_services_backup()
+        self.assertEqual(backup["format"], "orbit-control-services")
+        self.assertEqual(len(backup["services"]), 1)
+
+        restored = ProcessManager(self.root / "restored-data")
+        try:
+            added, updated = restored.import_services_backup(backup)
+
+            self.assertEqual((added, updated), (1, 0))
+            self.assertEqual(restored.get_service(self.service.id).name, "Worker")
+
+            backup["services"][0]["description"] = "Restaurado"
+            added, updated = restored.import_services_backup(backup)
+
+            self.assertEqual((added, updated), (0, 1))
+            self.assertEqual(restored.get_service(self.service.id).description, "Restaurado")
+        finally:
+            restored.close()
+
+    def test_reset_all_data_clears_configs_preferences_and_logs(self) -> None:
+        self.manager.storage.save_preferences({"theme": "dark", "compact_mode": True})
+        self.manager.storage.service_log_path(self.service.id).write_text("log", encoding="utf-8")
+        self.manager.storage.system_log_path.write_text("system", encoding="utf-8")
+
+        self.manager.reset_all_data()
+
+        self.assertEqual(self.manager.list_services(), [])
+        self.assertFalse(self.manager.storage.services_path.exists())
+        self.assertFalse(self.manager.storage.runtime_path.exists())
+        self.assertFalse(self.manager.storage.preferences_path.exists())
+        self.assertEqual(list(self.manager.storage.logs_dir.glob("*.log")), [])
+        self.assertTrue(self.manager.storage.archive_dir.exists())
 
     def test_old_services_are_migrated_in_alphabetical_order(self) -> None:
         legacy_data = self.root / "legacy-data"

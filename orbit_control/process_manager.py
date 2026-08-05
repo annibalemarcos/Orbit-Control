@@ -8,7 +8,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import psutil
 
@@ -239,6 +239,99 @@ class ProcessManager:
             for position, service_id in enumerate(ordered_ids):
                 self._services[service_id].position = position
             self._persist()
+
+    def export_services_backup(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "format": "orbit-control-services",
+                "version": 1,
+                "exported_at": utc_now(),
+                "services": [service.to_dict() for service in self._ordered_services()],
+            }
+
+    def import_services_backup(self, payload: dict[str, Any] | list[Any]) -> tuple[int, int]:
+        raw_services = payload.get("services") if isinstance(payload, dict) else payload
+        if not isinstance(raw_services, list):
+            raise ServiceError("Arquivo de backup invalido.")
+
+        configs: list[ServiceConfig] = []
+        seen_ids: set[str] = set()
+        for item in raw_services:
+            if not isinstance(item, dict):
+                raise ServiceError("Arquivo de backup contem um app invalido.")
+            config = ServiceConfig.from_dict(item)
+            self._validate(config)
+            if config.id in seen_ids:
+                raise ServiceError(f"Backup contem app duplicado: {config.name}")
+            seen_ids.add(config.id)
+            configs.append(config)
+
+        added = 0
+        updated = 0
+        with self._lock:
+            next_position = len(self._services)
+            imported: list[tuple[str, ServiceConfig]] = []
+            for config in configs:
+                current = self._services.get(config.id)
+                if current:
+                    config.position = current.position
+                    config.updated_at = utc_now()
+                    action = "atualizado"
+                    updated += 1
+                else:
+                    config.position = next_position
+                    next_position += 1
+                    self._state(config.id)
+                    action = "importado"
+                    added += 1
+                self._services[config.id] = config
+                imported.append((action, config))
+            self._normalize_positions()
+            self._persist()
+            for action, config in imported:
+                self._system_log("IMPORT", config, f"App {action} via backup JSON")
+        return added, updated
+
+    def set_autostart(self, service_id: str, enabled: bool) -> ServiceConfig:
+        with self._lock:
+            service = self.get_service(service_id)
+            service.autostart = bool(enabled)
+            service.updated_at = utc_now()
+            self._persist()
+            status = "ativado" if enabled else "desativado"
+            self._system_log("AUTOSTART", service, f"Iniciar com o app {status}")
+            return service
+
+    def reset_all_data(self) -> None:
+        services = self.list_services()
+        errors: list[str] = []
+        for service in services:
+            if not self.is_running(service.id):
+                continue
+            try:
+                self.stop(service.id)
+            except ServiceError as exc:
+                errors.append(f"{service.name}: {exc}")
+
+        if errors:
+            raise ServiceError("Nao foi possivel parar todos os servicos:\n" + "\n".join(errors))
+
+        with self._lock:
+            for process in list(self._popen.values()):
+                if process.poll() is not None:
+                    continue
+                try:
+                    process.terminate()
+                    process.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+            self._popen.clear()
+            self._services.clear()
+            self._runtime.clear()
+            self.storage.reset_all()
 
     def _validate(self, config: ServiceConfig) -> None:
         config.name = config.name.strip()
@@ -736,6 +829,9 @@ class ProcessManager:
                     name = service_id
                 errors.append(f"{name}: {exc}")
         return success, errors
+
+    def stop_all_services(self) -> tuple[int, list[str]]:
+        return self.bulk([service.id for service in self.list_services()], "stop")
 
     def is_running(self, service_id: str) -> bool:
         with self._lock:
